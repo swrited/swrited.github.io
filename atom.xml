@@ -5,7 +5,7 @@
         <link href="https://swrited.github.io/" rel="alternate" type="text/html"/>
         <link href="https://swrited.github.io/atom.xml" rel="self" type="application/atom+xml"/>
         <id>https://swrited.github.io/</id>
-        <updated>2026-06-05T03:02:27.590Z</updated>
+        <updated>2026-06-05T03:29:36.484Z</updated>
         <language>zh-Hans</language>
         <entry>
             <title>用 Cloudflare Email Routing + Worker 搭建自己的 WebMail 临时邮箱系统</title>
