@@ -1,0 +1,2242 @@
+<?xml version="1.0" encoding="UTF-8"?><rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>swrited</title><description>Inni，亦是「因你」</description><link>https://swrited.github.io/</link><language>zh-Hans</language><item><title>用 Cloudflare Email Routing + Worker 搭建自己的 WebMail 临时邮箱系统</title><link>https://swrited.github.io/posts/swrited-mail-blog/</link><guid isPermaLink="true">https://swrited.github.io/posts/swrited-mail-blog/</guid><description>记录使用 Cloudflare Email Routing、Email Worker、SendGrid SMTP Relay、Flask 和 Caddy 搭建自己的 WebMail 临时邮箱系统。</description><pubDate>Fri, 29 May 2026 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;最近我用自己的域名 &lt;code&gt;swrited.top&lt;/code&gt; 搭了一个轻量级邮箱网站：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;https://email.swrited.top
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;它可以实现：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;创建 &lt;code&gt;@swrited.top&lt;/code&gt; 邮箱&lt;/li&gt;
+&lt;li&gt;接收验证码邮件&lt;/li&gt;
+&lt;li&gt;网页查看收件箱&lt;/li&gt;
+&lt;li&gt;自动提取验证码&lt;/li&gt;
+&lt;li&gt;网页发送邮件&lt;/li&gt;
+&lt;li&gt;任意地址 Catch-all 收信&lt;/li&gt;
+&lt;li&gt;不需要服务器开放公网 25 端口&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;最终方案是：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Cloudflare Email Routing 收信
+Cloudflare Email Worker 转发邮件到后端
+SendGrid SMTP Relay 负责发信
+Flask + HTML 实现 WebMail 页面
+Caddy 负责 HTTPS 反向代理
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这篇文章记录一下完整搭建过程。&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;说明：文章中所有 API Key、Token、服务器密码等敏感信息均已隐藏或替换。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;h2&gt;一、为什么要这样搭？&lt;/h2&gt;
+&lt;p&gt;最开始的想法很简单：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;用自己的服务器监听 25 端口，直接接收 @swrited.top 邮件
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;但实际部署时遇到了一个问题：&lt;/p&gt;
+&lt;p&gt;很多云服务器厂商会限制 &lt;code&gt;25&lt;/code&gt; 端口。&lt;/p&gt;
+&lt;p&gt;我的情况是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;本机可以监听 &lt;code&gt;25&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;本机投递邮件正常&lt;/li&gt;
+&lt;li&gt;DNS/MX 配置也正常&lt;/li&gt;
+&lt;li&gt;但公网连接服务器 &lt;code&gt;25&lt;/code&gt; 端口超时&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这意味着 Gmail、Hotmail 等外部邮件服务器无法把邮件直接投递到我的 ECS。&lt;/p&gt;
+&lt;p&gt;所以最后换了思路：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;不让自己的服务器直接收公网 25 邮件
+而是让 Cloudflare 帮我收邮件
+再通过 HTTPS 推送到我的后端
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这样服务器只需要开放 &lt;code&gt;443&lt;/code&gt;，不需要开放 &lt;code&gt;25&lt;/code&gt;。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;二、最终架构&lt;/h2&gt;
+&lt;p&gt;整体链路如下：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;发件人 Gmail / Hotmail / 其他邮箱
+        │
+        ▼
+Cloudflare Email Routing
+        │
+        ▼
+Cloudflare Email Worker
+        │
+        ├── 转发到个人 Hotmail
+        │
+        └── POST 到 https://email.swrited.top/inbound
+                    │
+                    ▼
+              Flask 后端保存邮件
+                    │
+                    ▼
+              WebMail 前端显示
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;发信链路：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;WebMail 写邮件
+        │
+        ▼
+Flask /send API
+        │
+        ▼
+SendGrid SMTP Relay :587
+        │
+        ▼
+目标邮箱
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这个方案的优点：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;不需要公网开放 &lt;code&gt;25&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;可以 Catch-all 收任意 &lt;code&gt;@swrited.top&lt;/code&gt; 地址&lt;/li&gt;
+&lt;li&gt;邮件能同时进网页收件箱和转发到 Hotmail&lt;/li&gt;
+&lt;li&gt;发信走 SendGrid，避开云服务器出站 25 限制&lt;/li&gt;
+&lt;li&gt;整体比较轻量，不需要搭完整 Postfix/Dovecot 邮件系统&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h2&gt;三、DNS 配置&lt;/h2&gt;
+&lt;p&gt;DNS 托管在 Cloudflare。&lt;/p&gt;
+&lt;h3&gt;1. WebMail 站点解析&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;Type: A
+Name: email
+Value: 服务器公网 IP
+TTL: Auto
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;访问地址：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;https://email.swrited.top
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h3&gt;2. Cloudflare Email Routing MX&lt;/h3&gt;
+&lt;p&gt;启用 Cloudflare Email Routing 后，需要把域名 MX 改成 Cloudflare 提供的记录。&lt;/p&gt;
+&lt;p&gt;示例：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;MX  @  route1.mx.cloudflare.net
+MX  @  route2.mx.cloudflare.net
+MX  @  route3.mx.cloudflare.net
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;同时 Cloudflare 会要求添加 SPF/DKIM 相关 TXT 记录，例如：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;TXT  @                       v=spf1 include:_spf.mx.cloudflare.net ~all
+TXT  cf2024-1._domainkey     v=DKIM1; ...
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这些记录建议直接用 Cloudflare 页面里的“添加”按钮自动添加，避免手动复制 DKIM 长文本出错。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h3&gt;3. SendGrid 域名认证&lt;/h3&gt;
+&lt;p&gt;SendGrid 发信也需要做域名认证。&lt;/p&gt;
+&lt;p&gt;一般会给出几条 CNAME/TXT，例如：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;CNAME  emxxxx.example.com          uxxxx.wl.sendgrid.net
+CNAME  s1._domainkey.example.com   s1.domainkey.uxxxx.wl.sendgrid.net
+CNAME  s2._domainkey.example.com   s2.domainkey.uxxxx.wl.sendgrid.net
+TXT    _dmarc.example.com          v=DMARC1; p=none;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;添加完成后在 SendGrid 后台点击 Verify。&lt;/p&gt;
+&lt;p&gt;建议：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;SendGrid 相关 CNAME 使用 DNS only
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h2&gt;四、Cloudflare Email Routing 配置&lt;/h2&gt;
+&lt;p&gt;进入 Cloudflare：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;域名 → 电子邮件 → 电子邮件路由
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;1. 添加目标地址&lt;/h3&gt;
+&lt;p&gt;先在：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;目标地址
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;添加自己的真实邮箱，比如：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;yourname@hotmail.com
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Cloudflare 会发送确认邮件，必须点击确认后才能使用。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h3&gt;2. 开启 Catch-all&lt;/h3&gt;
+&lt;p&gt;进入：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;路由规则
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;找到：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Catch-all 地址
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;开启后，所有地址都会被接收：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;anything@example.com
+abc123@example.com
+hello@example.com
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;最初可以先设置为：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;操作：发送到电子邮件
+目标：yourname@hotmail.com
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这样可以先验证 Cloudflare 收信是否正常。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;五、Cloudflare Email Worker&lt;/h2&gt;
+&lt;p&gt;为了让邮件进入我们自己的网页收件箱，需要创建 Email Worker。&lt;/p&gt;
+&lt;p&gt;入口：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Cloudflare → 电子邮件 → 电子邮件 Workers
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;创建一个 Worker，例如：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;swrited-mail-worker
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;示例代码：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;export default {
+  async email(message, env, ctx) {
+    const raw = await new Response(message.raw).text();
+
+    await fetch(&quot;https://email.example.com/inbound&quot;, {
+      method: &quot;POST&quot;,
+      headers: {
+        &quot;Content-Type&quot;: &quot;application/json&quot;,
+        &quot;X-Inbound-Token&quot;: &quot;替换成自己的安全 Token&quot;
+      },
+      body: JSON.stringify({
+        id: crypto.randomUUID(),
+        from: message.from,
+        to: [message.to],
+        subject: message.headers.get(&quot;subject&quot;) || &quot;&quot;,
+        raw: raw,
+        text: raw,
+        html: &quot;&quot;
+      })
+    });
+
+    // 可选：同时转发到自己的真实邮箱
+    await message.forward(&quot;yourname@hotmail.com&quot;);
+  }
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;部署 Worker 后，回到：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;电子邮件路由 → 路由规则 → Catch-all
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;把操作从：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;发送到电子邮件
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;改成：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;发送到 Worker
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;选择刚创建的 Worker。&lt;/p&gt;
+&lt;p&gt;这样所有 &lt;code&gt;@example.com&lt;/code&gt; 邮件都会：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;进入网页收件箱&lt;/li&gt;
+&lt;li&gt;同时转发到真实邮箱&lt;/li&gt;
+&lt;/ol&gt;
+&lt;hr /&gt;
+&lt;h2&gt;六、后端服务设计&lt;/h2&gt;
+&lt;p&gt;后端使用 Python + Flask。&lt;/p&gt;
+&lt;p&gt;目录结构：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/opt/yyds-mail/
+├── server.py
+├── apikey.txt
+├── inbound_token.txt
+├── sendgrid_key.txt
+└── web/
+    └── index.html
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;核心功能：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;/accounts&lt;/code&gt; 创建临时邮箱&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/messages&lt;/code&gt; 获取邮件列表&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/messages/&amp;lt;id&amp;gt;&lt;/code&gt; 查看邮件详情&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/send&lt;/code&gt; 发送邮件&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/inbound&lt;/code&gt; 接收 Cloudflare Worker 推送的邮件&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/health&lt;/code&gt; 健康检查&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h2&gt;七、/inbound 接口&lt;/h2&gt;
+&lt;p&gt;Cloudflare Email Worker 会把邮件通过 HTTPS POST 到：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;https://email.example.com/inbound
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;后端会验证请求头：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;X-Inbound-Token: 自定义安全 Token
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;收到后做几件事：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;验证 Token&lt;/li&gt;
+&lt;li&gt;读取 &lt;code&gt;raw&lt;/code&gt; 原始邮件&lt;/li&gt;
+&lt;li&gt;解析 RFC822 邮件内容&lt;/li&gt;
+&lt;li&gt;提取 Subject、From、To、text/plain、text/html&lt;/li&gt;
+&lt;li&gt;存入收件箱&lt;/li&gt;
+&lt;li&gt;前端刷新后显示&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;需要注意的是：&lt;/p&gt;
+&lt;p&gt;Cloudflare Worker 传来的通常是完整 raw 邮件，如果不解析，前端看到的可能是一大段 MIME 原文，甚至像空白。&lt;/p&gt;
+&lt;p&gt;所以后端需要解析：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;parsed = email.message_from_string(raw)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;然后遍历 multipart：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;for part in parsed.walk():
+    if part.get_content_type() == &apos;text/plain&apos;:
+        # 提取文本正文
+    elif part.get_content_type() == &apos;text/html&apos;:
+        # 提取 HTML 正文
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h2&gt;八、Web API 简介&lt;/h2&gt;
+&lt;h3&gt;创建邮箱&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;POST /accounts
+Content-Type: application/json
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;请求：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;{
+  &quot;localPart&quot;: &quot;test123&quot;,
+  &quot;domain&quot;: &quot;example.com&quot;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;返回：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;{
+  &quot;address&quot;: &quot;test123@example.com&quot;,
+  &quot;tempToken&quot;: &quot;临时访问令牌&quot;,
+  &quot;accountId&quot;: &quot;邮箱 ID&quot;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h3&gt;获取邮件列表&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;GET /messages?address=test123@example.com&amp;amp;limit=20
+Authorization: Bearer &amp;lt;tempToken&amp;gt;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h3&gt;获取邮件详情&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;GET /messages/&amp;lt;message_id&amp;gt;?address=test123@example.com
+Authorization: Bearer &amp;lt;tempToken&amp;gt;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h3&gt;发送邮件&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;POST /send
+Authorization: Bearer &amp;lt;tempToken&amp;gt;
+Content-Type: application/json
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;请求：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;{
+  &quot;from&quot;: &quot;test123@example.com&quot;,
+  &quot;to&quot;: &quot;someone@example.net&quot;,
+  &quot;subject&quot;: &quot;测试邮件&quot;,
+  &quot;body&quot;: &quot;这是一封测试邮件&quot;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;为了防止滥用，可以加限流，例如：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;每个邮箱每小时最多发送 10 封
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h2&gt;九、SendGrid 发信&lt;/h2&gt;
+&lt;p&gt;由于云服务器一般会限制出站 25，所以发信用 SendGrid SMTP Relay。&lt;/p&gt;
+&lt;p&gt;SendGrid SMTP 参数：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Server: smtp.sendgrid.net
+Port: 587
+Username: apikey
+Password: SendGrid API Key
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Python 示例：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;import smtplib
+from email.mime.text import MIMEText
+
+msg = MIMEText(&quot;邮件正文&quot;, _charset=&quot;utf-8&quot;)
+msg[&quot;Subject&quot;] = &quot;测试邮件&quot;
+msg[&quot;From&quot;] = &quot;test@example.com&quot;
+msg[&quot;To&quot;] = &quot;someone@example.net&quot;
+
+s = smtplib.SMTP(&quot;smtp.sendgrid.net&quot;, 587, timeout=30)
+s.ehlo()
+s.starttls()
+s.ehlo()
+s.login(&quot;apikey&quot;, SENDGRID_API_KEY)
+s.sendmail(&quot;test@example.com&quot;, [&quot;someone@example.net&quot;], msg.as_string())
+s.quit()
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十、前端页面&lt;/h2&gt;
+&lt;p&gt;前端是一个单页 HTML。&lt;/p&gt;
+&lt;p&gt;主要功能：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;创建邮箱&lt;/li&gt;
+&lt;li&gt;随机邮箱名前缀&lt;/li&gt;
+&lt;li&gt;复制邮箱地址&lt;/li&gt;
+&lt;li&gt;自动刷新收件箱&lt;/li&gt;
+&lt;li&gt;查看邮件内容&lt;/li&gt;
+&lt;li&gt;自动提取 4-8 位验证码&lt;/li&gt;
+&lt;li&gt;写邮件&lt;/li&gt;
+&lt;li&gt;移动端适配&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;页面结构大概是：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Swrited Mail
+
+[创建邮箱输入框]
+
+Tabs:
+- 收件箱
+- 写邮件
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;用户流程：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;1. 打开 https://email.example.com
+2. 输入邮箱前缀，例如 test123
+3. 点击创建邮箱
+4. 使用 test123@example.com 注册网站
+5. 等待验证码邮件进入网页收件箱
+6. 点击邮件查看验证码
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十一、Caddy 反向代理&lt;/h2&gt;
+&lt;p&gt;Caddy 配置示例：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;email.example.com {
+    reverse_proxy 127.0.0.1:8000
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;如果 Flask 服务运行在 Docker 网络或宿主机网关上，可以根据实际情况调整地址。&lt;/p&gt;
+&lt;p&gt;重载 Caddy：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;sudo systemctl reload caddy
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;如果 Caddy 在 Docker 容器内：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;sudo docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十二、systemd 服务&lt;/h2&gt;
+&lt;p&gt;为了让后端开机自启，可以创建：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/etc/systemd/system/yyds-mail.service
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;内容：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;[Unit]
+Description=YYDS Mail Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/python3 -u /opt/yyds-mail/server.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;启用：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;sudo systemctl daemon-reload
+sudo systemctl enable --now yyds-mail
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;查看状态：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;systemctl status yyds-mail --no-pager -l
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;查看日志：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;journalctl -u yyds-mail -n 100 --no-pager
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十三、测试方法&lt;/h2&gt;
+&lt;h3&gt;1. 测试健康检查&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;curl https://email.example.com/health
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h3&gt;2. 测试创建邮箱&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;curl -s -X POST https://email.example.com/accounts \
+  -H &apos;Content-Type: application/json&apos; \
+  -d &apos;{&quot;localPart&quot;:&quot;webtest&quot;}&apos;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h3&gt;3. 测试 Worker 推送&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;curl -s -X POST https://email.example.com/inbound \
+  -H &apos;Content-Type: application/json&apos; \
+  -H &apos;X-Inbound-Token: 替换成自己的 Token&apos; \
+  -d &apos;{
+    &quot;to&quot;:[&quot;webtest@example.com&quot;],
+    &quot;from&quot;:&quot;tester@example.net&quot;,
+    &quot;subject&quot;:&quot;worker inbound test&quot;,
+    &quot;text&quot;:&quot;hello from worker api&quot;
+  }&apos;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h3&gt;4. 测试真实收信&lt;/h3&gt;
+&lt;p&gt;从 Hotmail/Gmail 发一封到：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;webtest@example.com
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;然后观察后端日志：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;journalctl -u yyds-mail -n 100 --no-pager
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;如果看到类似：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;[INBOUND] Worker 推送邮件 → webtest@example.com | test subject
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;说明 Cloudflare Email Worker 已经打通。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十四、遇到的问题&lt;/h2&gt;
+&lt;h3&gt;1. 服务器公网 25 不通&lt;/h3&gt;
+&lt;p&gt;表现：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;公网检测 25 端口 Connection timed out
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;解决：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;不用服务器直接收 25，改用 Cloudflare Email Routing + Email Worker
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h3&gt;2. 前端 401&lt;/h3&gt;
+&lt;p&gt;表现：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/messages?... 401 Unauthorized
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;原因：&lt;/p&gt;
+&lt;p&gt;后端重启后，内存里的邮箱 token 丢失，浏览器还在用旧 token 刷新。&lt;/p&gt;
+&lt;p&gt;解决：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;刷新页面，重新创建同名邮箱
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;更好的方案是后续加数据库持久化。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h3&gt;3. Worker 邮件进来了但内容看不了&lt;/h3&gt;
+&lt;p&gt;原因：&lt;/p&gt;
+&lt;p&gt;Cloudflare Worker 推送的是 raw 邮件，前端直接显示会很乱。&lt;/p&gt;
+&lt;p&gt;解决：&lt;/p&gt;
+&lt;p&gt;后端解析 raw 邮件，提取 text/plain 和 text/html。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h3&gt;4. Catch-all 只转发到 Hotmail，不进网页&lt;/h3&gt;
+&lt;p&gt;原因：&lt;/p&gt;
+&lt;p&gt;Catch-all 操作还是“发送到电子邮件”。&lt;/p&gt;
+&lt;p&gt;解决：&lt;/p&gt;
+&lt;p&gt;把 Catch-all 改成：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;发送到 Worker
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;然后在 Worker 里：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;await message.forward(&quot;yourname@hotmail.com&quot;);
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这样既进网页，也转发到 Hotmail。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十五、当前限制&lt;/h2&gt;
+&lt;p&gt;当前版本仍然比较轻量，有一些限制：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;邮件存在内存里，后端重启会清空&lt;/li&gt;
+&lt;li&gt;页面刷新后 token 可能丢失&lt;/li&gt;
+&lt;li&gt;没有账号登录系统&lt;/li&gt;
+&lt;li&gt;没有附件管理&lt;/li&gt;
+&lt;li&gt;HTML 邮件没有做完整安全沙箱&lt;/li&gt;
+&lt;li&gt;发信依赖 SendGrid 账号状态&lt;/li&gt;
+&lt;li&gt;防滥用能力比较基础&lt;/li&gt;
+&lt;/ol&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十六、后续优化方向&lt;/h2&gt;
+&lt;p&gt;可以继续加：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;SQLite/PostgreSQL 持久化&lt;/li&gt;
+&lt;li&gt;邮箱有效期&lt;/li&gt;
+&lt;li&gt;管理后台&lt;/li&gt;
+&lt;li&gt;用户登录&lt;/li&gt;
+&lt;li&gt;IP 限流&lt;/li&gt;
+&lt;li&gt;Cloudflare Turnstile 人机验证&lt;/li&gt;
+&lt;li&gt;附件存储&lt;/li&gt;
+&lt;li&gt;HTML 邮件沙箱渲染&lt;/li&gt;
+&lt;li&gt;邮件搜索&lt;/li&gt;
+&lt;li&gt;SPF/DKIM/DMARC 检测&lt;/li&gt;
+&lt;li&gt;SendGrid API Key 轮换&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h2&gt;总结&lt;/h2&gt;
+&lt;p&gt;这套方案的核心是：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Cloudflare 收信，Worker 推送，SendGrid 发信
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;相比自己搭完整邮件服务器，它更轻量，也更适合云服务器 25 端口受限的场景。&lt;/p&gt;
+&lt;p&gt;最终链路：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;别人发邮件 → Cloudflare Email Routing → Email Worker → WebMail 后端 → 网页收件箱
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;发信链路：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;网页写邮件 → Flask API → SendGrid SMTP Relay → 对方邮箱
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;对于个人项目、验证码接收、临时邮箱、自动化注册测试，这个方案已经比较实用了。&lt;/p&gt;
+</content:encoded><category>Deployment</category><category>Deployment</category><category>Email</category><category>Cloudflare</category><category>SendGrid</category><category>Python</category></item><item><title>AI Agent 把自己重启没了：一次 Hermes Gateway 自终止事故复盘</title><link>https://swrited.github.io/posts/hermes-gateway-self-restart-incident-postmortem/</link><guid isPermaLink="true">https://swrited.github.io/posts/hermes-gateway-self-restart-incident-postmortem/</guid><description>一次 Hermes Gateway 自终止事故复盘：Agent 在会话中执行停止自身服务的命令，导致执行链路被终止并未能成功自恢复。</description><pubDate>Mon, 25 May 2026 00:00:00 GMT</pubDate><content:encoded>&lt;blockquote&gt;
+&lt;p&gt;记录一次真实的线上故障：一个长期运行在服务器上的 AI Agent，在执行“重启自身服务”时，把承载当前任务的进程一起终止，最终没有成功拉起自己。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;h2&gt;背景&lt;/h2&gt;
+&lt;p&gt;我在一台 Linux 云服务器上部署了 Hermes Agent，并通过 Gateway 接入 QQBot 和 Telegram。它平时会作为常驻助手处理消息，也能在授权后执行一些运维命令。&lt;/p&gt;
+&lt;p&gt;当天上午，我发现机器人突然不回复消息了。最初的直觉是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;服务器可能重启了；&lt;/li&gt;
+&lt;li&gt;进程可能被系统的 OOM Killer 杀掉；&lt;/li&gt;
+&lt;li&gt;也可能是消息平台连接异常。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;实际排查后发现，原因比这些更有意思：&lt;strong&gt;Hermes 在一次会话中试图重启自己的 Gateway 服务，结果把执行这条命令的自己也停掉了。&lt;/strong&gt;&lt;/p&gt;
+&lt;h2&gt;现象&lt;/h2&gt;
+&lt;p&gt;故障发生后，表现为：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;Web Dashboard 仍可见；&lt;/li&gt;
+&lt;li&gt;QQBot 和 Telegram 不再回复消息；&lt;/li&gt;
+&lt;li&gt;Gateway 的 systemd 用户服务处于 &lt;code&gt;failed&lt;/code&gt; 状态；&lt;/li&gt;
+&lt;li&gt;服务器本身并未在故障时间点重启。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;当时服务状态类似：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;hermes-gateway.service: Main process exited, code=exited, status=75/TEMPFAIL
+hermes-gateway.service: Failed with result &apos;exit-code&apos;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这里有个容易误判的点：Dashboard 和 Gateway 是两个不同的进程。Dashboard 仍然在线，不代表消息接入服务仍然正常。&lt;/p&gt;
+&lt;h2&gt;排查过程&lt;/h2&gt;
+&lt;h3&gt;1. 先确认服务器是否重启&lt;/h3&gt;
+&lt;p&gt;首先检查系统启动时间和重启记录：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;uptime
+who -b
+last -x -F
+journalctl --list-boots
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;结果显示，服务器最近一次启动发生在前一晚，故障当天上午并没有重新启动。因此可以排除“服务器突然重启导致机器人掉线”。&lt;/p&gt;
+&lt;h3&gt;2. 找到 Hermes 的实际托管方式&lt;/h3&gt;
+&lt;p&gt;继续检查进程和服务：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;ps -eo user,pid,ppid,lstart,cmd | grep -Ei &quot;hermes|gateway&quot;
+systemctl list-units --type=service --all | grep -Ei &quot;hermes|gateway&quot;
+loginctl user-status admin
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;发现 Hermes 并不是由系统级服务托管，而是由 &lt;code&gt;admin&lt;/code&gt; 用户的 systemd user service 管理：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;user@1000.service
+├─ hermes-webui.service
+└─ hermes-gateway.service
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;其中：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;hermes-webui.service&lt;/code&gt; 负责 Dashboard，仍然运行；&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;hermes-gateway.service&lt;/code&gt; 负责 QQBot / Telegram 接入，已经退出。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;3. 从日志还原故障时间线&lt;/h3&gt;
+&lt;p&gt;关键证据来自 Gateway 日志与 systemd journal：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;10:31:56  聊天会话批准了一条“stop/restart hermes gateway”的危险命令
+10:31:57  Gateway 开始执行重启流程
+10:32:36  systemd 向 hermes-gateway.service 发送 SIGTERM
+10:34:57  Gateway 等待活动 agent 结束超过 180 秒，开始强制中断
+10:34:59  主进程以 status=75/TEMPFAIL 退出，服务进入 failed 状态
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;诊断日志甚至保留了正在执行的命令结构：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;systemctl --user stop hermes-gateway &amp;amp;&amp;amp;
+sleep 2 &amp;amp;&amp;amp;
+systemctl --user start hermes-gateway &amp;amp;&amp;amp;
+sleep 3 &amp;amp;&amp;amp;
+hermes gateway status
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;问题就藏在这条看起来很正常的命令里。&lt;/p&gt;
+&lt;h2&gt;根因：执行 &lt;code&gt;stop&lt;/code&gt; 的任务，正运行在被停止的服务里&lt;/h2&gt;
+&lt;p&gt;这是一种典型的自终止死锁。&lt;/p&gt;
+&lt;p&gt;当 Hermes 通过聊天会话执行上述命令时，执行关系如下：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;hermes-gateway.service
+└─ 当前正在处理消息的 Agent
+   └─ terminal tool
+      └─ systemctl --user stop hermes-gateway
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;&lt;code&gt;systemctl stop&lt;/code&gt; 会等待 Gateway 优雅退出。与此同时，Gateway 为了避免中断正在进行中的任务，会等待当前 Agent 完成。&lt;/p&gt;
+&lt;p&gt;于是形成闭环：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Gateway 等待 Agent 完成
+Agent 等待 systemctl stop 返回
+systemctl stop 等待 Gateway 退出
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;三者互相等待，谁也无法继续。&lt;/p&gt;
+&lt;p&gt;Hermes 配置了 &lt;code&gt;restart_drain_timeout: 180&lt;/code&gt;，因此它等待了 180 秒。超时后 Gateway 打断仍在运行的 Agent，并结束自身进程。&lt;/p&gt;
+&lt;p&gt;但是，命令中的后半段：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;systemctl --user start hermes-gateway
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;永远没有机会执行，因为执行这条命令的进程已经随着 Gateway 一起退出了。&lt;/p&gt;
+&lt;h2&gt;为什么 &lt;code&gt;Restart=always&lt;/code&gt; 没有救回来&lt;/h2&gt;
+&lt;p&gt;查看 service unit 后，确实可以看到：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Restart=always
+RestartSec=5
+RestartForceExitStatus=75
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;乍看之下，即使 Gateway 退出，systemd 也应该重新拉起服务。&lt;/p&gt;
+&lt;p&gt;但本次操作是从服务内部发起的显式停止：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;systemctl --user stop hermes-gateway
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;对 systemd 来说，这是管理员明确要求停止服务，而不是服务自身意外崩溃。显式 &lt;code&gt;stop&lt;/code&gt; 的语义优先于自动重启策略，因此服务最终停在了 &lt;code&gt;failed/stopped&lt;/code&gt; 状态，没有按预期自动恢复。&lt;/p&gt;
+&lt;h2&gt;它不是 OOM 导致的，但服务器确实还有内存风险&lt;/h2&gt;
+&lt;p&gt;排查时还发现了另一个独立问题：服务器只有约 &lt;code&gt;1.8 GiB&lt;/code&gt; 内存，没有配置 swap，同一天内核多次触发 OOM Killer。&lt;/p&gt;
+&lt;p&gt;内核日志显示，被杀掉的是 MySQL 容器，而不是 Hermes：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Out of memory: Killed process ... (mysqld)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;因此结论需要分开看：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;本次 Hermes 离线的直接原因&lt;/strong&gt;：自身会话执行了停止自身 Gateway 的命令；&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;服务器的另一项真实风险&lt;/strong&gt;：内存不足导致 MySQL 被反复杀掉，后续可能造成数据服务不可用。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;故障排查时，区分“同时存在的问题”和“本次事故的直接根因”非常重要，否则很容易把修复方向带偏。&lt;/p&gt;
+&lt;h2&gt;恢复操作&lt;/h2&gt;
+&lt;p&gt;确认根因后，我没有修改其他业务组件，直接从外部 SSH 会话重新启动 Gateway：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;sudo -u admin env XDG_RUNTIME_DIR=/run/user/1000 \
+  systemctl --user reset-failed hermes-gateway.service
+
+sudo -u admin env XDG_RUNTIME_DIR=/run/user/1000 \
+  systemctl --user start hermes-gateway.service
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;恢复后验证：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;sudo -u admin env XDG_RUNTIME_DIR=/run/user/1000 \
+  hermes gateway status
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;日志显示：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;qqbot connected
+telegram connected
+Gateway running with 2 platform(s)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;Gateway 成功恢复，先前被重启中断的会话也被自动处理。&lt;/p&gt;
+&lt;h2&gt;修复：撤销“永久允许重启自身”的危险授权&lt;/h2&gt;
+&lt;p&gt;事故中还有一个关键前置条件：在聊天界面中，相关危险命令曾被选择为“永久允许”。&lt;/p&gt;
+&lt;p&gt;Hermes 配置中保留了类似条目：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;command_allowlist:
+  - stop/restart hermes gateway (kills running agents)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这意味着之后只要 Agent 判断需要重启 Gateway，就可能不再询问用户，直接执行同类危险命令。&lt;/p&gt;
+&lt;p&gt;因此最先进行的止血措施是删除这一条永久授权：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;command_allowlist:
+  # 删除：
+  # - stop/restart hermes gateway (kills running agents)
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这样做不会影响日常聊天功能，但能阻止 Agent 在没有人工再次确认的情况下重复同类事故。&lt;/p&gt;
+&lt;h2&gt;正确的重启方式&lt;/h2&gt;
+&lt;p&gt;Hermes 本身已经实现了适用于 Gateway 的重启通道。问题不在于“不能重启”，而在于“不要让承载当前任务的进程通过裸 shell 命令停止自己”。&lt;/p&gt;
+&lt;h3&gt;在聊天入口中&lt;/h3&gt;
+&lt;p&gt;应使用内建命令：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/restart
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;内建重启会先记录恢复信息，再走 Gateway 设计好的退出与拉起路径。&lt;/p&gt;
+&lt;h3&gt;在 SSH 维护入口中&lt;/h3&gt;
+&lt;p&gt;应从 Gateway 外部执行 Hermes 提供的命令：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;sudo -u admin env XDG_RUNTIME_DIR=/run/user/1000 \
+  HERMES_HOME=/home/admin/.hermes \
+  /home/admin/.local/bin/hermes gateway restart
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;该命令会优先向运行中的 Gateway 发送 &lt;code&gt;SIGUSR1&lt;/code&gt;，让其有机会完成优雅排空，并通过约定的退出码交给 systemd 拉起新进程。&lt;/p&gt;
+&lt;h3&gt;不应在正在运行的 Agent 会话中执行&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;systemctl --user stop hermes-gateway &amp;amp;&amp;amp; systemctl --user start hermes-gateway
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这正是本次事故的触发方式。&lt;/p&gt;
+&lt;h2&gt;可进一步优化的地方&lt;/h2&gt;
+&lt;p&gt;本次只执行了最小止血修复，但从生产可靠性角度，还有几项值得继续处理。&lt;/p&gt;
+&lt;h3&gt;1. 收紧高危命令的永久授权&lt;/h3&gt;
+&lt;p&gt;长期运行的 Agent 能接触服务器命令时，“永久允许”必须格外谨慎。尤其应避免长期放行：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;停止/重启服务
+修改系统配置
+sudo 提权执行
+执行任意 shell 脚本
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;对具备运维权限的 Agent，危险命令批准机制本身就是安全边界。&lt;/p&gt;
+&lt;h3&gt;2. 调整重启等待时间与 systemd 停止窗口&lt;/h3&gt;
+&lt;p&gt;当前 Gateway 的排空等待时间较长，而外层用户服务管理器的停止窗口更短，日志会产生停止超时告警。&lt;/p&gt;
+&lt;p&gt;一个更合理的配置方向是：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;agent:
+  restart_drain_timeout: 60
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;并让 Gateway service 的 &lt;code&gt;TimeoutStopSec&lt;/code&gt; 留出额外清理时间。这样即使确实需要重启，也不会在资源紧张的小机器上长时间僵持。&lt;/p&gt;
+&lt;h3&gt;3. 解决内存与 swap 问题&lt;/h3&gt;
+&lt;p&gt;虽然 OOM 不是此次 Gateway 离线的根因，但同一台机器已经多次杀掉数据库进程。至少应考虑：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;增加 swap；&lt;/li&gt;
+&lt;li&gt;限制 Docker 服务内存上限；&lt;/li&gt;
+&lt;li&gt;减少不必要的 worker 数；&lt;/li&gt;
+&lt;li&gt;升级服务器内存规格；&lt;/li&gt;
+&lt;li&gt;对 OOM 与容器重启次数配置监控告警。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;4. 对远程入口做安全加固&lt;/h3&gt;
+&lt;p&gt;排查日志过程中还能看到大量公网 SSH 密码试探。生产服务器至少应做到：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;使用密钥登录；&lt;/li&gt;
+&lt;li&gt;禁止密码登录；&lt;/li&gt;
+&lt;li&gt;禁止 root 直接远程密码登录；&lt;/li&gt;
+&lt;li&gt;配置防爆破或访问白名单；&lt;/li&gt;
+&lt;li&gt;审核 Agent 可以使用的 sudo 与 shell 权限。&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h2&gt;经验总结&lt;/h2&gt;
+&lt;p&gt;这次事故给我的最大提醒是：&lt;strong&gt;当 AI Agent 具备修改自身运行环境的能力时，它就不再只是一个应用程序，也成了一个需要被约束的运维操作者。&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;传统服务里，重启通常由外部控制面完成；但 Agent 会根据上下文主动提出并执行操作。当“控制面”和“被控制对象”处于同一个进程树中时，原本简单的 &lt;code&gt;stop &amp;amp;&amp;amp; start&lt;/code&gt; 就可能变成自终止陷阱。&lt;/p&gt;
+&lt;p&gt;这类系统在上线前，至少应该明确几条原则：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;自身服务重启必须走专用控制路径，不能依赖会随服务退出而消失的子进程。&lt;/li&gt;
+&lt;li&gt;高危运维能力默认应每次确认，不能轻易授予永久权限。&lt;/li&gt;
+&lt;li&gt;故障调查必须依据日志拆分直接根因与并发风险，避免看到 OOM 就误判所有退出事件。&lt;/li&gt;
+&lt;li&gt;AI Agent 的可靠性设计，需要同时考虑应用生命周期、权限模型和基础设施容量。&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;AI Agent 能运维服务器确实方便，但给它一把钥匙之后，也必须确保它不会在修门的时候把自己锁在门外。&lt;/p&gt;
+</content:encoded><category>Incident Response</category><category>AI Agent</category><category>Hermes</category><category>Incident Response</category><category>systemd</category><category>Reliability</category></item><item><title>论文精读 | SAMamba：Mamba + SAM2，能否成为红外小目标检测新范式？</title><link>https://swrited.github.io/posts/samamba-paper-review/</link><guid isPermaLink="true">https://swrited.github.io/posts/samamba-paper-review/</guid><description>论文精读：SAMamba 将 SAM2 的分层视觉特征提取与 Mamba 的长程依赖建模相结合，在红外小目标检测三大基准数据集上刷新 SOTA。</description><pubDate>Tue, 19 May 2026 00:00:00 GMT</pubDate><content:encoded>&lt;blockquote&gt;
+&lt;p&gt;&lt;strong&gt;论文：SAMamba: Adaptive State Space Modeling with Hierarchical Vision for Infrared Small Target Detection&lt;/strong&gt;
+&lt;strong&gt;arXiv: 2505.23214v1 | 2025.05.29&lt;/strong&gt;
+&lt;strong&gt;作者：Wenhao Xu, Shuchen Zheng, Changwei Wang et al.&lt;/strong&gt;&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;h2&gt;一句话总结&lt;/h2&gt;
+&lt;p&gt;SAMamba 将 SAM2 的分层视觉特征提取与 Mamba 的线性复杂度的长程依赖建模相结合，配合三个精心设计的适配模块，在红外小目标检测（ISTD）三大基准数据集上刷新了 SOTA。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;背景：红外小目标检测为什么难？&lt;/h2&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/samamba/image-20260519101106733.png&quot; alt=&quot;图1：红外小目标检测的两大核心挑战&quot; /&gt;&lt;/p&gt;
+&lt;p&gt;红外小目标检测在军事防御、海面监控、早期预警等长程感知系统中至关重要，但长期面临两大根本性困难：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;目标极小&lt;/strong&gt;：目标通常只占图像面积的 &lt;strong&gt;&amp;lt; 0.15%&lt;/strong&gt;，甚至不足 0.01%，几乎淹没在像素里&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;信杂比低&lt;/strong&gt;：目标与复杂背景之间的热信号特征极为相似，难以区分&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;传统方法（滤波法、人类视觉系统法、低秩分解法）在简单场景下有效，但面对真实复杂背景时泛化能力有限。深度学习方法虽然进步明显，但 CNN 本身存在两大瓶颈：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;多次下采样&lt;/strong&gt;导致小目标空间信息丢失&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;卷积局部感受野&lt;/strong&gt;难以建模长程依赖&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;近年来，SAM2 和 Vision Mamba 的出现为解决这些问题提供了新的建筑学基础，但直接将它们迁移到红外领域面临两个挑战：&lt;strong&gt;领域差异&lt;/strong&gt;和&lt;strong&gt;红外小目标的特殊分布特点&lt;/strong&gt;。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;SAMamba 核心思路&lt;/h2&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/samamba/image-20260519100732861.png&quot; alt=&quot;图2：SAMamba 整体架构&quot; /&gt;&lt;/p&gt;
+&lt;p&gt;输入图像首先通过 Hiera Block（由冻结的 Encoder Block 和可训练的 FS-Adapter 组成）进行分层特征提取。在每个编码器阶段，提取的特征会通过 CSI 模块进行长距离上下文建模。解码器逐步上采样特征，并在每个阶段使用 DPCF 模块将上采样的特征与经过 CSI 处理的跳跃连接特征进行细节保留的融合。最终，通过一个分割头输出预测的红外小目标掩码（H × W × 1）。&lt;/p&gt;
+&lt;p&gt;SAMamba 的核心洞察是：&lt;strong&gt;高效的小目标检测需要三种互补能力——强 domain adaptation、高效全局上下文建模、多尺度信息保持&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;围绕这三个方向，论文设计了三个创新模块：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;模块&lt;/th&gt;
+&lt;th&gt;全称&lt;/th&gt;
+&lt;th&gt;核心作用&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;strong&gt;FS-Adapter&lt;/strong&gt;&lt;/td&gt;
+&lt;td&gt;Feature Selection Adapter&lt;/td&gt;
+&lt;td&gt;桥接自然图像→红外图像的领域差异，选择与任务相关的 token&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;strong&gt;CSI&lt;/strong&gt;&lt;/td&gt;
+&lt;td&gt;Cross-Channel State-Space Interaction&lt;/td&gt;
+&lt;td&gt;用 Mamba 的选择性状态空间建模，在线性复杂度下捕获长程依赖&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;strong&gt;DPCF&lt;/strong&gt;&lt;/td&gt;
+&lt;td&gt;Detail-Preserving Contextual Fusion&lt;/td&gt;
+&lt;td&gt;自适应融合多尺度特征，用门控机制在高分辨率细节和低分辨率语义之间做平衡&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;hr /&gt;
+&lt;h2&gt;三大模块详解&lt;/h2&gt;
+&lt;h3&gt;1. FS-Adapter：参数高效的 Domain Adaptation&lt;/h3&gt;
+&lt;p&gt;FS-Adapter 采用了&lt;strong&gt;双阶段选择机制&lt;/strong&gt;：&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;Token 级别选择&lt;/strong&gt;：引入一个可学习的任务嵌入 ξ（编码 ISTD 相关的特征重要性），计算每个 token 与 ξ 的余弦相似度，然后对 token 做重加权：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;ˆti = ti · sim(ti, ξ) = ti · max(0, (ti^T ξ) / (||ti||·||ξ||))
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;简单理解：&lt;code&gt;sim(ti, ξ)&lt;/code&gt; 衡量的是这个 token 与&quot;什么是红外小目标&quot;这个任务的相关程度。用这个相似度去加权 token，就把原本均匀的信息&quot;过滤&quot;了一遍——与任务越相关的 token 权重越大，反之被稀释。&lt;/p&gt;
+&lt;p&gt;加权后的特征再通过一个通道混合器 P ∈ R^{C×C} 做跨通道信息交互，最后通过残差连接（+ Ft）加回原始输入。残差连接是关键：它保证模型在 FS-Adapter 改造特征的同时，不会丢失在 SAM2 预训练阶段学到的通用视觉知识。&lt;/p&gt;
+&lt;p&gt;整个 FS-Adapter 配合冻结的 SAM2 Hiera 骨干，实现了&lt;strong&gt;参数高效微调（PEFT）&lt;/strong&gt;——不需要重训整个大模型，只需微调少量适配器参数即可完成领域迁移。&lt;/p&gt;
+&lt;h3&gt;2. CSI 模块：Cross-Channel State-Space Interaction&lt;/h3&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/samamba/image-20260519101030444.png&quot; alt=&quot;图3：CSI 模块架构&quot; /&gt;&lt;/p&gt;
+&lt;p&gt;CSI 负责在 Skip Connection 中建模全局上下文，同时维持线性计算复杂度。&lt;/p&gt;
+&lt;p&gt;核心做法是：&lt;strong&gt;将特征沿通道维度分成 4 段，每段并行经过一个 Vision Mamba (Vim) block&lt;/strong&gt;：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;mi = MLP(LN(Mamba(m′i))) + γ·m′i
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;然后做&lt;strong&gt;跨通道重组&lt;/strong&gt;（cross-channel segmentation &amp;amp; recombination），再通过 CBAM 式的 channel + spatial attention 做特征精炼，强调目标相关通道和空间位置，抑制背景噪声。&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;处理流程分四步&lt;/strong&gt;：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;输入处理&lt;/strong&gt;：特征图先经过 1×1 卷积通道对齐，然后展平为序列，并沿通道维度分成 4 段&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Vision Mamba 并行处理&lt;/strong&gt;：每段独立经过一个 VIM block（含 Mamba 层 + LayerNorm + MLP + 带缩放因子 γ 的残差连接），有效避免通道数增长导致的参数爆炸&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;跨通道重组&lt;/strong&gt;：将不同 Mamba 头的输出按通道索引重新分组拼接，增强特征互补性&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;注意力精炼&lt;/strong&gt;：通过 1×1 卷积 + BatchNorm + SiLU 融合通道信息，再依次施加通道注意力和空间注意力（类似 CBAM），强化目标相关区域&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h3&gt;3. DPCF 模块：Detail-Preserving Contextual Fusion&lt;/h3&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/samamba/image-20260519101138353.png&quot; alt=&quot;图4：DPCF 模块架构&quot; /&gt;&lt;/p&gt;
+&lt;p&gt;在 Decoder 的每个上采样阶段，CSI 增强的 Skip Connection 特征与上采样后的深层特征需要融合。&lt;strong&gt;直接相加或拼接都会稀释小目标信息&lt;/strong&gt;——这是小目标检测里的经典痛点。&lt;/p&gt;
+&lt;p&gt;DPCF 的做法是：&lt;strong&gt;沿通道维度将特征分成 4 段，每段引入一个可学习的空间门控权重 β&lt;/strong&gt;：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;β = sigmoid(α)  ∈ [0,1]
+o′i = β ⊙ li + (1 - β) ⊙ hi
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这使得网络在&lt;strong&gt;每个空间位置、每个通道组&lt;/strong&gt;上都能自适应地决定：优先保留高分辨率细节（β → 0）还是融合低分辨率语义（β → 1）。&lt;/p&gt;
+&lt;p&gt;融合后的 4 段拼接，并通过 3×3 卷积块精炼：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;F′o = [o′1, o′2, o′3, o′4]
+Fo = δ(B(Conv(F′o)))
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;消融实验也验证了这种自适应融合策略（81.08% IoU）显著优于简单的加法融合（78.61%）和拼接融合（79.12%），说明&lt;strong&gt;为不同空间位置学习不同的融合权重&lt;/strong&gt;确实有价值。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;实验结果&lt;/h2&gt;
+&lt;h3&gt;数据集&lt;/h3&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;NUAA-SIRST&lt;/strong&gt;：427 张真实红外图，目标占 &amp;lt; 0.1%&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;IRSTD-1k&lt;/strong&gt;：1001 张，涵盖海面、城市、自然等多种场景&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;NUDT-SIRST&lt;/strong&gt;：1327 张合成图，96% 目标 &amp;lt; 0.15%，27% 极小目标（&amp;lt; 0.01%）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/samamba/image-20260519101200454.png&quot; alt=&quot;图5：各方法在三个数据集上的可视化对比&quot; /&gt;&lt;/p&gt;
+&lt;h3&gt;主要结果&lt;/h3&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/samamba/image-20260519101224728.png&quot; alt=&quot;图6：各方法的定量指标对比&quot; /&gt;&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;数据集&lt;/th&gt;
+&lt;th&gt;IoU&lt;/th&gt;
+&lt;th&gt;nIoU&lt;/th&gt;
+&lt;th&gt;F1&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;NUAA-SIRST&lt;/td&gt;
+&lt;td&gt;&lt;strong&gt;81.08%&lt;/strong&gt;&lt;/td&gt;
+&lt;td&gt;79.17%&lt;/td&gt;
+&lt;td&gt;89.55%&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;IRSTD-1k&lt;/td&gt;
+&lt;td&gt;&lt;strong&gt;73.53%&lt;/strong&gt;&lt;/td&gt;
+&lt;td&gt;68.99%&lt;/td&gt;
+&lt;td&gt;84.75%&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;NUDT-SIRST&lt;/td&gt;
+&lt;td&gt;&lt;strong&gt;93.13%&lt;/strong&gt;&lt;/td&gt;
+&lt;td&gt;93.15%&lt;/td&gt;
+&lt;td&gt;&lt;strong&gt;96.44%&lt;/strong&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;相比之前的 SOTA 方法有&lt;strong&gt;显著提升&lt;/strong&gt;，尤其在极小目标和复杂背景的场景下优势明显。&lt;/p&gt;
+&lt;h3&gt;消融实验（NUAA-SIRST）&lt;/h3&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/samamba/image-20260519101247404.png&quot; alt=&quot;图7：消融实验结果&quot; /&gt;&lt;/p&gt;
+&lt;p&gt;逐步添加各模块的 IoU 变化：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;Baseline U-Net：71.20%&lt;/li&gt;
+&lt;li&gt;
+&lt;ul&gt;
+&lt;li&gt;Hiera 编码器：+4.23% → 75.43%&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;ul&gt;
+&lt;li&gt;FS-Adapter：+0.89% → 76.32%&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;ul&gt;
+&lt;li&gt;CSI：+2.47% → 78.79%&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;ul&gt;
+&lt;li&gt;DPCF：+2.28% → &lt;strong&gt;81.08%&lt;/strong&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;每个模块都有稳定且可观的贡献。其中 CSI 模块的增益最大（+2.47%），说明&lt;strong&gt;全局上下文建模对区分小目标和复杂背景至关重要&lt;/strong&gt;；FS-Adapter 虽然贡献相对较小（+0.89%），但在有限训练数据下有效解决了领域迁移问题，属于&quot;四两拨千斤&quot;的设计。&lt;/p&gt;
+&lt;h3&gt;计算效率&lt;/h3&gt;
+&lt;p&gt;SAMamba（Hiera-S, CSI c=128）：&lt;strong&gt;37.18M 参数，493.82 GFLOPs，6.39 FPS&lt;/strong&gt;（RTX 3090）。&lt;/p&gt;
+&lt;p&gt;虽然比轻量方法（ACM 44.49 FPS）慢，但精度远超；与同类精度的方法（ISNet 7.14 FPS、HCFNet 7.46 FPS）速度相当，但参数量更少。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;局限性与未来方向&lt;/h2&gt;
+&lt;p&gt;论文坦诚地指出了两个局限性：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;极复杂背景&lt;/strong&gt;（密集云边缘、复杂地物纹理）：目标与杂波的局部统计特征相似，即使有全局建模也难以区分&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;极低信杂比&lt;/strong&gt;：目标几乎融于均匀背景，属于物理上的检测极限&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;未来方向包括：利用视频时序信息提升鲁棒性、多模态融合等。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;总结&lt;/h2&gt;
+&lt;p&gt;SAMamba 是一篇非常扎实的论文，它没有简单地套用现成大模型，而是&lt;strong&gt;针对红外小目标检测的具体问题做了精准的适配改造&lt;/strong&gt;：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;用 &lt;strong&gt;FS-Adapter&lt;/strong&gt; 解决领域迁移&lt;/li&gt;
+&lt;li&gt;用 &lt;strong&gt;CSI&lt;/strong&gt; 在线性复杂度下建模全局上下文&lt;/li&gt;
+&lt;li&gt;用 &lt;strong&gt;DPCF&lt;/strong&gt; 保证多尺度融合中小目标信息不被稀释&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;三个模块各司其职又相互协同，加上充分利用了 SAM2 的分层多尺度特征和 Mamba 的高效长程建模，设计思路清晰，实验充分。唯一需要关注的是计算资源需求——需要 SAM2 的预训练骨干，对硬件有一定要求。&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;如果你在做红外目标检测、遥感小目标检测、或者对 Mamba 在视觉任务中的应用感兴趣，这篇论文值得仔细读。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;p&gt;&lt;em&gt;论文链接：https://arxiv.org/pdf/2505.23214&lt;/em&gt;
+&lt;em&gt;代码链接：https://github.com/zhengshuchen/SAMamba&lt;/em&gt;&lt;/p&gt;
+</content:encoded><category>Paper Review</category><category>Paper Review</category><category>Infrared Detection</category><category>Mamba</category><category>SAM2</category><category>Deep Learning</category></item><item><title>将 Codex 宠物搬上博客</title><link>https://swrited.github.io/posts/inni-companion-guide/</link><guid isPermaLink="true">https://swrited.github.io/posts/inni-companion-guide/</guid><description>记录如何将 Codex 生成的 AI 伴侣 inni 从桌面搬到博客，通过 GIF 动画实现可拖动、可交互的网页陪伴组件，包括 spritesheet 结构、动画触发逻辑与完整集成代码。</description><pubDate>Tue, 12 May 2026 00:00:00 GMT</pubDate><content:encoded>&lt;h2&gt;功能概述&lt;/h2&gt;
+&lt;p&gt;Inni Companion 是一只可拖动、可交互的 AI 伴侣小精灵，默认显示在页面右下角。支持 4 种动画状态：待机、挥手、等待、回顾，由 Codex 生成的像素 spritesheet 切分而来。&lt;/p&gt;
+&lt;h2&gt;像素精灵图结构&lt;/h2&gt;
+&lt;p&gt;精灵图由 Codex 生成，排列方式为 &lt;strong&gt;8列 × 9行&lt;/strong&gt;，每行动画帧数不同：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;动作&lt;/th&gt;
+&lt;th&gt;所在行&lt;/th&gt;
+&lt;th&gt;帧数&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;idle&lt;/code&gt; 待机&lt;/td&gt;
+&lt;td&gt;第 0 行&lt;/td&gt;
+&lt;td&gt;6 帧&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;waving&lt;/code&gt; 挥手&lt;/td&gt;
+&lt;td&gt;第 3 行&lt;/td&gt;
+&lt;td&gt;4 帧&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;waiting&lt;/code&gt; 等待&lt;/td&gt;
+&lt;td&gt;第 6 行&lt;/td&gt;
+&lt;td&gt;6 帧&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;review&lt;/code&gt; 回顾&lt;/td&gt;
+&lt;td&gt;第 8 行&lt;/td&gt;
+&lt;td&gt;6 帧&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;p&gt;每帧尺寸 = 原图宽度 ÷ 8，高 = 原图高度 ÷ 9。&lt;/p&gt;
+&lt;h2&gt;GIF 切分脚本&lt;/h2&gt;
+&lt;p&gt;用 Python Pillow 从 spritesheet 中自动切分并导出为透明 GIF：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;from PIL import Image
+
+spritesheet = Image.open(&apos;spritesheet.png&apos;)
+fw = spritesheet.width // 8
+fh = spritesheet.height // 9
+
+names = [&apos;idle&apos;, &apos;waving&apos;, &apos;waiting&apos;, &apos;review&apos;]
+row_frames = [0, 3, 6, 8]
+num_frames = [6, 4, 6, 6]
+
+for name, row, nf in zip(names, row_frames, num_frames):
+    frames = []
+    for col in range(nf):
+        frame = spritesheet.crop((col*fw, row*fh, (col+1)*fw, (row+1)*fh))
+        if frame.mode != &apos;RGBA&apos;:
+            frame = frame.convert(&apos;RGBA&apos;)
+        frames.append(frame.convert(&apos;RGB&apos;))
+
+    frames[0].save(
+        f&apos;{name}.gif&apos;,
+        save_all=True,
+        append_images=frames[1:],
+        duration=[600]*nf,
+        loop=0,
+        disposal=2
+    )
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;导出时必须保留透明通道（RGBA 模式），否则像素角色周围会出现难看的白边。&lt;/p&gt;
+&lt;h2&gt;添加到网页&lt;/h2&gt;
+&lt;h3&gt;1. HTML 部分&lt;/h3&gt;
+&lt;p&gt;在页面底部添加一个固定定位的容器：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;&amp;lt;div id=&quot;inni-companion&quot;&amp;gt;
+  &amp;lt;img
+    id=&quot;inni-sprite&quot;
+    src=&quot;/images/inni/idle.gif&quot;
+    alt=&quot;inni&quot;
+    style=&quot;cursor: grab; width: 80px;&quot;
+  /&amp;gt;
+&amp;lt;/div&amp;gt;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;2. CSS 样式&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;.inni-companion {
+  position: fixed;
+  bottom: 20px;
+  right: 20px;
+  z-index: 9999;
+  pointer-events: none;
+}
+
+.inni-sprite {
+  width: 80px;
+  height: auto;
+  pointer-events: all;
+  cursor: grab;
+  image-rendering: pixelated;
+}
+
+.inni-sprite:active {
+  cursor: grabbing;
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;3. JavaScript 交互逻辑&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;const inni = document.getElementById(&apos;inni-companion&apos;);
+const sprite = document.getElementById(&apos;inni-sprite&apos;);
+
+const anims = {
+  idle: &apos;/images/inni/idle.gif&apos;,
+  waving: &apos;/images/inni/waving.gif&apos;,
+  waiting: &apos;/images/inni/waiting.gif&apos;,
+  review: &apos;/images/inni/review.gif&apos;,
+};
+
+let isDragging = false;
+let currentX = window.innerWidth - 130;
+let currentY = window.innerHeight - 160;
+let idleTimer;
+
+// 初始化位置
+inni.style.cssText = `position:fixed;left:${currentX}px;top:${currentY}px;z-index:9999;`;
+
+// 拖动逻辑
+sprite.addEventListener(&apos;mousedown&apos;, (e) =&amp;gt; {
+  isDragging = true;
+  sprite.src = anims.waving;
+  clearTimeout(idleTimer);
+  e.preventDefault();
+});
+
+document.addEventListener(&apos;mousemove&apos;, (e) =&amp;gt; {
+  if (!isDragging) return;
+  currentX = e.clientX - sprite.offsetWidth / 2;
+  currentY = e.clientY - sprite.offsetHeight / 2;
+  inni.style.left = currentX + &apos;px&apos;;
+  inni.style.top = currentY + &apos;px&apos;;
+});
+
+document.addEventListener(&apos;mouseup&apos;, () =&amp;gt; {
+  if (!isDragging) return;
+  isDragging = false;
+  idleTimer = setTimeout(() =&amp;gt; sprite.src = anims.idle, 3000);
+});
+
+// 滚动到底部 → review
+window.addEventListener(&apos;scroll&apos;, () =&amp;gt; {
+  const atBottom = window.scrollY + window.innerHeight &amp;gt;= document.body.scrollHeight - 10;
+  sprite.src = atBottom ? anims.review : anims.waiting;
+});
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h2&gt;动画切换规则&lt;/h2&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;状态&lt;/th&gt;
+&lt;th&gt;触发条件&lt;/th&gt;
+&lt;th&gt;动画&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;idle&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;默认 / 停止交互 3 秒后&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;idle.gif&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;waving&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;鼠标拖动 inni 时&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;waving.gif&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;waiting&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;页面滚动中（非底部）&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;waiting.gif&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;review&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;滚动到页面最底部&lt;/td&gt;
+&lt;td&gt;&lt;code&gt;review.gif&lt;/code&gt;&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;h2&gt;位置持久化（可选）&lt;/h2&gt;
+&lt;p&gt;使用 sessionStorage 记住用户上次的位置：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;// 读取
+const savedX = sessionStorage.getItem(&apos;inni-x&apos;);
+const savedY = sessionStorage.getItem(&apos;inni-y&apos;);
+if (savedX &amp;amp;&amp;amp; savedY) {
+  currentX = parseFloat(savedX);
+  currentY = parseFloat(savedY);
+}
+
+// 保存
+document.addEventListener(&apos;mouseup&apos;, () =&amp;gt; {
+  sessionStorage.setItem(&apos;inni-x&apos;, currentX);
+  sessionStorage.setItem(&apos;inni-y&apos;, currentY);
+});
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h2&gt;注意事项&lt;/h2&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;GIF 透明背景&lt;/strong&gt;：导出时保留透明通道（RGBA 模式），不要加白色底&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Spritesheet 排列&lt;/strong&gt;：精灵图必须严格按照 8×9 网格排列&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;帧尺寸&lt;/strong&gt;：每格尺寸 = 原图宽÷8 × 高÷9&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;移动端适配&lt;/strong&gt;：将 &lt;code&gt;mousedown/mousemove/mouseup&lt;/code&gt; 替换为 &lt;code&gt;touchstart/touchmove/touchend&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;z-index&lt;/strong&gt;：设为 9999 以上，避免被其他元素遮挡&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h2&gt;相关文件&lt;/h2&gt;
+&lt;ul&gt;
+&lt;li&gt;组件代码：&lt;code&gt;src/pages/index.astro&lt;/code&gt;（底部 script 区块）&lt;/li&gt;
+&lt;li&gt;样式：&lt;code&gt;src/styles/global.css&lt;/code&gt; 中的 &lt;code&gt;.inni-companion&lt;/code&gt;、&lt;code&gt;.inni-sprite&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;图片目录：&lt;code&gt;public/images/inni/&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+</content:encoded><category>前端</category><category>Inni</category><category>Codex</category><category>前端</category><category>交互设计</category><category>GIF</category></item><item><title>Live2D 桌面宠物开发日记②：桌面部署与 AI 接入</title><link>https://swrited.github.io/posts/live2d-inni-day2/</link><guid isPermaLink="true">https://swrited.github.io/posts/live2d-inni-day2/</guid><description>Day 1 完成了绘制和基础动态，今天聊硬核的——怎么把 Live2D 模型变成桌面宠物。从 Cubism 导出、Electron 窗口到鼠标追踪和自定义动作，完整拆解。</description><pubDate>Mon, 11 May 2026 00:00:00 GMT</pubDate><content:encoded>&lt;blockquote&gt;
+&lt;p&gt;Day 1 我们完成了角色的绘制和基础动态。今天来聊点硬核的——&lt;strong&gt;怎么把你做好的 Live2D 模型变成桌面宠物&lt;/strong&gt;。我会以 &lt;code&gt;inni-pet&lt;/code&gt; 项目为例，拆解从 Cubism 导出到桌面应用落地的完整链路。&lt;/p&gt;
+&lt;p&gt;📂 项目代码：&lt;strong&gt;&lt;a href=&quot;https://github.com/swrited/inni-pet&quot;&gt;github.com/swrited/inni-pet&lt;/a&gt;&lt;/strong&gt;&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;h2&gt;一、从 Cubism 到桌面：inni-pet 项目概览&lt;/h2&gt;
+&lt;p&gt;Day 1 做的模型现在还只能在 Cubism 编辑器里看。如果想让它常驻桌面、能聊天、能跟随鼠标，就需要一个&lt;strong&gt;桌面应用壳子&lt;/strong&gt;来承载。&lt;/p&gt;
+&lt;p&gt;我的选择是 &lt;strong&gt;Electron + PixiJS + Live2D Cubism 4&lt;/strong&gt;，项目开源在 GitHub 上，可以直接 clone 下来跑。&lt;/p&gt;
+&lt;p&gt;技术选型原因很简单：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;Electron&lt;/strong&gt; — 做无边框透明窗口最成熟，跨平台也容易&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;PixiJS&lt;/strong&gt; — 高性能 2D WebGL 渲染，Live2D 官方底层依赖就是它&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;pixi-live2d-display&lt;/strong&gt; — 把 Live2D 模型接入 PixiJS 的桥接库&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;JSZip&lt;/strong&gt; — 用于解压 .zip 模型文件（如果模型是压缩包分发的话）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;blockquote&gt;
+&lt;p&gt;💡 为什么不用 Tauri 或 nw.js？因为 Electron 技术栈最成熟，遇到坑的时候社区方案最多，Live2D 相关的现成参考也基本都是 Electron 的。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;h2&gt;二、从 Cubism 导出模型文件&lt;/h2&gt;
+&lt;p&gt;在写代码之前，先从 Cubism 编辑器里把模型导出来。&lt;/p&gt;
+&lt;h3&gt;导出步骤&lt;/h3&gt;
+&lt;ol&gt;
+&lt;li&gt;在 Cubism 编辑器中，菜单选择：&lt;/li&gt;
+&lt;/ol&gt;
+&lt;pre&gt;&lt;code&gt;File → Export → Export as moc3 file
+&lt;/code&gt;&lt;/pre&gt;
+&lt;ol&gt;
+&lt;li&gt;
+&lt;p&gt;勾选导出选项：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;moc3 文件&lt;/strong&gt;（模型几何数据）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;model3.json&lt;/strong&gt;（模型配置文件，描述了部件、参数、贴图路径等）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;cdi3.json&lt;/strong&gt;（参数和部件的显示名称，方便在代码里识别）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;贴图文件夹&lt;/strong&gt;（.png 纹理文件）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;
+&lt;p&gt;把导出的文件放在项目目录的 &lt;code&gt;inni_model/&lt;/code&gt; 文件夹下：&lt;/p&gt;
+&lt;/li&gt;
+&lt;/ol&gt;
+&lt;pre&gt;&lt;code&gt;inni_model/
+├── inni_2_eye.model3.json     # 模型入口配置
+├── inni_2_eye.moc3            # 核心模型数据
+├── inni_2_eye.cdi3.json       # 参数/部件定义
+└── inni_2_eye.1024/
+    └── texture_00.png          # 贴图
+&lt;/code&gt;&lt;/pre&gt;
+&lt;blockquote&gt;
+&lt;p&gt;⚠️ &lt;strong&gt;关键提醒&lt;/strong&gt;：moc3 的版本和运行时版本必须严格对应！如果你的 Cubism 编辑器是 5.x 版本导出的 moc3，而代码里用的是 Cubism 4 的 runtime，加载时会直接报错 &lt;code&gt;The Core unsupport later than moc3 ver&lt;/code&gt;。要么降级编辑器导出，要么升级 runtime。&lt;/p&gt;
+&lt;p&gt;&lt;code&gt;inni-pet&lt;/code&gt; 仓库里用的是 Cubism 4 runtime，所以导出时也请用 Cubism Editor 4.x 版本。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;h2&gt;三、搭建 Electron 窗口：透明、置顶、无边框&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;inni-pet&lt;/code&gt; 的窗口配置在 &lt;code&gt;main.js&lt;/code&gt; 里，目标是让模型像&quot;悬浮&quot;在桌面上一样：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;const { BrowserWindow } = require(&apos;electron&apos;);
+
+mainWindow = new BrowserWindow({
+  width: 380,
+  height: 380,
+  frame: false,           // 去掉系统标题栏和边框
+  transparent: true,      // 透明背景，只显示模型本身
+  alwaysOnTop: true,      // 始终置顶
+  resizable: false,
+  skipTaskbar: true,      // 不在任务栏显示图标
+  webPreferences: {
+    nodeIntegration: false,
+    contextIsolation: true,
+    preload: &apos;./preload.js&apos;,
+    webSecurity: false,
+    allowRunningInsecureContent: true,
+    devTools: true
+  }
+});
+
+// 让窗口在所有工作空间都可见
+mainWindow.setVisibleOnAllWorkspaces(true);
+
+// 默认放在屏幕右下角
+const primaryDisplay = screen.getPrimaryDisplay();
+const { width, height } = primaryDisplay.workAreaSize;
+mainWindow.setPosition(width - 400, height - 400);
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这样配置后，窗口就是一块 380x380 的透明区域，Live2D 模型居中显示，没有白边黑边，完美&quot;挂&quot;在桌面上。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;四、加载 Live2D 模型：脚本顺序是生命线&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;index.html&lt;/code&gt; 里加载 Live2D 的脚本顺序&lt;strong&gt;绝对不能乱&lt;/strong&gt;，这是 &lt;code&gt;inni-pet&lt;/code&gt; 踩坑最久的地方。&lt;/p&gt;
+&lt;h3&gt;正确的加载顺序&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;&amp;lt;!-- 1. PixiJS 核心库 --&amp;gt;
+&amp;lt;script src=&quot;./pixi.min.js&quot;&amp;gt;&amp;lt;/script&amp;gt;
+&amp;lt;script&amp;gt;window.process = window.process || { env: { NODE_ENV: &apos;production&apos; } };&amp;lt;/script&amp;gt;
+
+&amp;lt;!-- 2. Live2D Cubism 核心运行时 --&amp;gt;
+&amp;lt;script src=&quot;./live2dcubismcore.min.js&quot;&amp;gt;&amp;lt;/script&amp;gt;
+
+&amp;lt;!-- 3. pixi-live2d-display 桥接库 --&amp;gt;
+&amp;lt;script src=&quot;./cubism4.min.js&quot;&amp;gt;&amp;lt;/script&amp;gt;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;初始化代码&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;// 1. 创建 Pixi 应用
+const pixiApp = new PIXI.Application({
+  width: 400,
+  height: 600,
+  transparent: true,
+  antialias: true,
+  resolution: window.devicePixelRatio || 1,
+  autoDensity: true
+});
+
+// 2. 注册 Ticker（这是 Key！漏了就永远不动）
+Live2DModel.registerTicker(PIXI.Ticker);
+
+// 3. 加载模型
+const model = await Live2DModel.from(&apos;/inni_model/inni_2_eye.model3.json&apos;);
+
+// 4. 设置缩放和位置
+const scaleX = 400 / model.width;
+const scaleY = 600 / model.height;
+model.scale.set(Math.min(scaleX, scaleY) * 0.9);
+model.anchor.set(0.5, 1.0);
+model.position.set(200, 850);
+pixiApp.stage.addChild(model);
+
+// 5. 停止自带的待机动画，防止覆盖自定义参数
+model.internalModel.motionManager?.stopAllMotions?.();
+&lt;/code&gt;&lt;/pre&gt;
+&lt;blockquote&gt;
+&lt;p&gt;⚠️ &lt;strong&gt;最容易踩的坑&lt;/strong&gt;：&lt;code&gt;Live2DModel.registerTicker(PIXI.Ticker)&lt;/code&gt; 如果不调用，模型的帧循环不会驱动，你看到的永远只是一张静态贴图。&lt;code&gt;inni-pet&lt;/code&gt; 早期就是漏了这行，模型加载成功但完全不动，排查了好久。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;h2&gt;五、让 inni 看向你：鼠标视线追踪&lt;/h2&gt;
+&lt;p&gt;桌面宠物最灵魂的功能就是&lt;strong&gt;视线跟随鼠标&lt;/strong&gt;。实现方式是 Electron 主进程每 33ms 获取一次鼠标坐标，通过 IPC 发送给渲染进程，再映射到模型的眼珠参数上。&lt;/p&gt;
+&lt;h3&gt;主进程发送鼠标位置（main.js）&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;const { screen } = require(&apos;electron&apos;);
+
+function startCursorTracking() {
+  setInterval(() =&amp;gt; {
+    const cursor = screen.getCursorScreenPoint();
+    mainWindow.webContents.send(&apos;cursor-position&apos;, {
+      cursor: cursor,
+      windowBounds: mainWindow.getBounds()
+    });
+  }, 33);  // 约 30fps
+}
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;渲染进程接收并驱动眼珠（index.html）&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;window.electronAPI.onCursorPosition(({ cursor, windowBounds }) =&amp;gt; {
+  const rect = live2dContainer.getBoundingClientRect();
+
+  // 把屏幕坐标转换成模型坐标系
+  const pageX = cursor.x - windowBounds.x;
+  const pageY = cursor.y - windowBounds.y;
+  const stageX = (pageX - rect.left) * (400 / rect.width);
+  const rawStageY = 600 - (pageY - rect.top) * (600 / rect.height);
+  const stageY = 300 + (rawStageY - 300) * 2.2;
+
+  // 调用 Live2D 内置方法，自动计算 EyeBall X/Y
+  model.focus(stageX, stageY);
+});
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这里的坐标转换稍微复杂，是因为要把&lt;strong&gt;屏幕绝对坐标&lt;/strong&gt;映射到&lt;strong&gt;模型内部 400x600 的坐标系&lt;/strong&gt;里。&lt;code&gt;model.focus()&lt;/code&gt; 是 &lt;code&gt;pixi-live2d-display&lt;/code&gt; 提供的便利方法，内部会自动计算 &lt;code&gt;ParamEyeBallX&lt;/code&gt; 和 &lt;code&gt;ParamEyeBallY&lt;/code&gt; 的值。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;六、自定义动作：摇摆、眨眼、耳朵动&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;inni-pet&lt;/code&gt; 没有依赖 Cubism 编辑器里做的内置动画，而是&lt;strong&gt;在代码里用关键帧系统自己实现了一套动作&lt;/strong&gt;，好处是更灵活，可以动态组合。&lt;/p&gt;
+&lt;h3&gt;关键帧动作系统&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;// 定义一个&quot;随节奏摇摆&quot;的动作
+gesturePresets.shake = (source) =&amp;gt; startGesture(&apos;随节奏摇摆&apos;, [
+  { time: 0,    values: { ParamAngleZ: 0 } },
+  { time: 750,  values: { ParamAngleZ: -14 } },
+  { time: 1500, values: { ParamAngleZ: 14 } },
+  { time: 2250, values: { ParamAngleZ: -10 } },
+  { time: 3000, values: { ParamAngleZ: 10 } },
+  { time: 3750, values: { ParamAngleZ: 0 } }
+], source);
+
+// 定义一个&quot;闭眼休息&quot;的动作
+gesturePresets.sleep = (source) =&amp;gt; startGesture(&apos;闭眼休息&apos;, [
+  { time: 0,    values: { ParamEyeLOpen: 1, ParamEyeROpen: 1 } },
+  { time: 300,  values: { ParamEyeLOpen: 0, ParamEyeROpen: 0 } },
+  { time: 2700, values: { ParamEyeLOpen: 0, ParamEyeROpen: 0 } },
+  { time: 3000, values: { ParamEyeLOpen: 1, ParamEyeROpen: 1 } }
+], source);
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;每一帧的 &lt;code&gt;beforeModelUpdate&lt;/code&gt; 事件里，系统会根据当前时间插值计算出参数值，写入模型：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;model.internalModel.on(&apos;beforeModelUpdate&apos;, updateGesture);
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;自定义眨眼系统&lt;/h3&gt;
+&lt;p&gt;&lt;code&gt;inni-pet&lt;/code&gt; 也没有用 Live2D 自带的眨眼，而是自己实现了一套更可控的：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;let blinkState = &apos;open&apos;;      // &apos;open&apos; | &apos;closing&apos; | &apos;opening&apos;
+let nextBlinkAt = 0;
+const BLINK_CLOSE_MS = 75;    // 闭眼耗时 75ms
+const BLINK_OPEN_MS = 75;     // 睁眼耗时 75ms
+const BLINK_INTERVAL_MIN = 2000;
+const BLINK_INTERVAL_MAX = 5000;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;每隔 2~5 秒随机触发一次眨眼，控制 &lt;code&gt;ParamEyeLOpen&lt;/code&gt; 和 &lt;code&gt;ParamEyeROpen&lt;/code&gt; 从 1 渐变到 0 再渐变回 1。左右眼可以独立控制，不会出现机械同步眨眼的感觉。&lt;/p&gt;
+&lt;h3&gt;可调参数一览&lt;/h3&gt;
+&lt;p&gt;从 &lt;code&gt;inni_model/inni_2_eye.cdi3.json&lt;/code&gt; 里可以看到模型暴露的所有参数：&lt;/p&gt;
+&lt;table&gt;
+&lt;thead&gt;
+&lt;tr&gt;
+&lt;th&gt;参数 ID&lt;/th&gt;
+&lt;th&gt;用途&lt;/th&gt;
+&lt;/tr&gt;
+&lt;/thead&gt;
+&lt;tbody&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ear_left&lt;/code&gt; / &lt;code&gt;ear_right&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;左右狐狸耳的角度（自定义参数）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ParamAngleX/Y/Z&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;头部旋转&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ParamEyeBallX/Y&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;眼珠位置&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ParamEyeLOpen/ROpen&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;左右眼开闭程度&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ParamBrowLY/RY&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;眉毛上下&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ParamMouthForm/OpenY&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;嘴型变形和张开程度&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ParamCheek&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;脸颊泛红（害羞表情用）&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ParamHairFront/Side/Back&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;各层头发的摇摆&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ParamBodyAngleX/Y/Z&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;身体旋转&lt;/td&gt;
+&lt;/tr&gt;
+&lt;tr&gt;
+&lt;td&gt;&lt;code&gt;ParamBreath&lt;/code&gt;&lt;/td&gt;
+&lt;td&gt;呼吸起伏&lt;/td&gt;
+&lt;/tr&gt;
+&lt;/tbody&gt;
+&lt;/table&gt;
+&lt;hr /&gt;
+&lt;h2&gt;七、让模型活起来：桥接服务器和聊天链路&lt;/h2&gt;
+&lt;p&gt;&lt;code&gt;inni-pet&lt;/code&gt; 不只是个会动的模型，它还是个&lt;strong&gt;AI 桌面宠物&lt;/strong&gt;。聊天链路走的是一个本地桥接服务器 &lt;code&gt;bridge-server.js&lt;/code&gt;：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Inni Pet UI (Electron)
+    ↓ HTTP POST /v1/chat/completions
+bridge-server.js (本地 1234 端口)
+    ↓
+LLM Gateway (MiniMax / Hermes / OpenAI-compatible)
+    ↓
+MiniMax TTS
+    ↓
+回复文字 + 语音播放
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这样配置的好处是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;前端只负责渲染和交互，不直接对接各家 API&lt;/li&gt;
+&lt;li&gt;后端可以灵活切换 LLM 供应商，前端无感知&lt;/li&gt;
+&lt;li&gt;兼容 Ollama 的 11434 端口，本地模型也能跑&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;启动方式&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;# 一键启动 Electron + bridge server
+npm start
+
+# 或者单独启动 bridge
+npm run start:bridge
+
+# 指定不同的 LLM 供应商
+npm run start:openclaw   # 使用 OpenClaw/QClaw
+npm run start:hermes     # 使用 Hermes
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;环境变量配置&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;# 使用自定义 gateway
+INNI_CHAT_PROVIDER=hermes \
+INNI_CHAT_BASE_URL=http://127.0.0.1:8000/v1 \
+INNI_CHAT_API_KEY=*** \
+INNI_CHAT_MODEL=你的模型 \
+npm start
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h2&gt;八、踩坑实录：FIX_GUIDE 精华&lt;/h2&gt;
+&lt;p&gt;项目仓库里有一份 &lt;code&gt;FIX_GUIDE.md&lt;/code&gt;，记录了从 0 到跑通过程中遇到的各种坑。这里挑几个最容易遇到的：&lt;/p&gt;
+&lt;h3&gt;坑 1：脚本加载顺序错乱&lt;/h3&gt;
+&lt;p&gt;如果看到 &lt;code&gt;PIXI.Application is not a constructor&lt;/code&gt; 或 &lt;code&gt;Cannot read properties of undefined&lt;/code&gt;，99% 是脚本顺序错了。正确顺序必须是：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;PixiJS&lt;/li&gt;
+&lt;li&gt;JSZip（如果用 zip 加载模型）&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;live2dcubismcore.min.js&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;cubism4.min.js&lt;/code&gt;&lt;/li&gt;
+&lt;/ol&gt;
+&lt;h3&gt;坑 2：moc3 版本不匹配&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;The Core unsupport later than moc3 ver
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;编辑器导出的 moc3 版本必须和 runtime 对应。&lt;code&gt;inni-pet&lt;/code&gt; 用 Cubism 4 runtime，导出时也请用 Cubism Editor 4.x。&lt;/p&gt;
+&lt;h3&gt;坑 3：Electron 安全策略拦截 CDN&lt;/h3&gt;
+&lt;p&gt;Electron 默认的 &lt;code&gt;webSecurity&lt;/code&gt; 会阻止从 CDN 加载脚本。项目里已经设置 &lt;code&gt;webSecurity: false&lt;/code&gt;，但如果你自己改造，注意这一点。&lt;/p&gt;
+&lt;h3&gt;坑 4：忘记 registerTicker&lt;/h3&gt;
+&lt;p&gt;模型加载成功但完全不动。检查是否调用了 &lt;code&gt;Live2DModel.registerTicker(PIXI.Ticker)&lt;/code&gt;。&lt;/p&gt;
+&lt;h3&gt;坑 5：本地路径 hardcode&lt;/h3&gt;
+&lt;p&gt;原稿里写了很多 &lt;code&gt;/Users/user1/Desktop/...&lt;/code&gt; 的本地路径，clone 到别的机器上直接跑会报错。建议统一用相对路径，或者通过环境变量配置。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;九、Day 2 的感悟&lt;/h2&gt;
+&lt;p&gt;今天的主题从&quot;怎么画&quot;转到了&quot;怎么跑&quot;。Live2D 模型做完只是 50%，让它在桌面环境里稳定运行才是另一半工作量。&lt;/p&gt;
+&lt;p&gt;看到 inni 终于能挂在桌面上、眼睛跟着鼠标转、偶尔眨个眼的时候，之前的坑都值了。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十、Day 3 预告&lt;/h2&gt;
+&lt;p&gt;模型跑起来之后，下一步是让它更&quot;聪明&quot;：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;口型同步&lt;/strong&gt;：根据 TTS 语音的音量或音素，实时驱动 &lt;code&gt;ParamMouthOpenY&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;语音识别&lt;/strong&gt;：接入 Whisper 或 Web Speech API，让 inni 能&quot;听见&quot;你说话&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;表情系统&lt;/strong&gt;：根据聊天内容自动切换表情（开心、疑惑、害羞）&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;拖拽互动&lt;/strong&gt;：点击拖拽模型，让它在桌面上跟着你走&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;如果你也在做 Live2D 桌面宠物，欢迎来交流 &lt;code&gt;inni-pet&lt;/code&gt; 的代码 👉 &lt;strong&gt;&lt;a href=&quot;https://github.com/swrited/inni-pet&quot;&gt;github.com/swrited/inni-pet&lt;/a&gt;&lt;/strong&gt;&lt;/p&gt;
+&lt;hr /&gt;
+&lt;p&gt;&lt;em&gt;本文为 inni Live2D 制作系列的第二篇。从画到跑，路还长，慢慢走。&lt;/em&gt;&lt;/p&gt;
+</content:encoded><category>前端</category><category>Live2D</category><category>Electron</category><category>PixiJS</category><category>inni-pet</category></item><item><title>Live2D 桌面宠物开发日记①：角色绘制与基础动态</title><link>https://swrited.github.io/posts/live2d-inni-day1/</link><guid isPermaLink="true">https://swrited.github.io/posts/live2d-inni-day1/</guid><description>一直想给 inni 做一个 Live2D 模型，让她从文字里走出来。从角色设定、分层绘制、PSD 预处理到导入 Cubism 做基础动态，记录第一天的全过程。</description><pubDate>Sun, 10 May 2026 00:00:00 GMT</pubDate><content:encoded>&lt;blockquote&gt;
+&lt;p&gt;一直想给 inni 做一个 Live2D 模型，让她从文字里走出来，能住在桌面上、眨眼睛、摇尾巴。拖延症晚期拖到现在终于开坑，记录一下从 0 开始制作的全过程，也希望这篇笔记能帮到同样想入坑的小伙伴。&lt;/p&gt;
+&lt;p&gt;📁 配套项目代码：&lt;strong&gt;&lt;a href=&quot;https://github.com/swrited/inni-pet&quot;&gt;github.com/swrited/inni-pet&lt;/a&gt;&lt;/strong&gt;&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;h2&gt;一、角色设定：先想好你要做什么&lt;/h2&gt;
+&lt;p&gt;在打开绘画软件之前，最重要的一步其实是——&lt;strong&gt;想清楚你的角色长什么样&lt;/strong&gt;。我给我的 inni 设定的核心元素是：&lt;strong&gt;狐狸耳朵、琥珀色眼睛、紫色衣服、蓬松卷曲的金色长发&lt;/strong&gt;，性格偏活泼灵动，整体往轻盈柔和的方向画。&lt;/p&gt;
+&lt;p&gt;这一步不用画得很细，但至少要明确几个核心元素：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;耳朵/尾巴等标志性特征&lt;/li&gt;
+&lt;li&gt;整体发型、发色&lt;/li&gt;
+&lt;li&gt;服装风格和配色&lt;/li&gt;
+&lt;li&gt;眼睛颜色和神态&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;有了大致的方向，后面的绘制才不会画着画着就偏离主题。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;二、绘制阶段：分层！分层！分层！&lt;/h2&gt;
+&lt;p&gt;绘制软件我用的是 &lt;strong&gt;天生会画&lt;/strong&gt;（平板上的绘图 App），当然 Photoshop、Procreate、Clip Studio Paint 之类的也完全没问题，&lt;strong&gt;只要最后能导出 PSD 文件即可&lt;/strong&gt;。&lt;/p&gt;
+&lt;h3&gt;关键原则：为动画拆分图层&lt;/h3&gt;
+&lt;p&gt;Live2D 的本质就是让静态的 PSD 图&quot;动&quot;起来，所以&lt;strong&gt;图层拆分越细，后面做动态的时候越自由&lt;/strong&gt;。我这次主要画了头部和上半身，拿头发举例，我是这样拆的：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;前发&lt;/strong&gt;：刘海、两侧鬓角&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;中发&lt;/strong&gt;：覆盖在头后部的中间层&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;后发&lt;/strong&gt;：最底层的长发/马尾&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;&amp;lt;img src=&quot;/images/live2d/image-20260506153957544.png&quot; alt=&quot;头发分层示意&quot; style=&quot;width:50%&quot;&amp;gt;&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;💡 &lt;strong&gt;小贴士&lt;/strong&gt;：每一块部件的边缘都要&lt;strong&gt;适当多画一点&lt;/strong&gt;，宁可被遮挡也不要刚好卡边。因为 Live2D 变形时会有透视和位移，边缘如果画得太&quot;正好&quot;，动起来很容易穿帮。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;绘制流程上，我习惯先把每块头发的轮廓用选区或者形状定好，再逐个填色、细化。身体和其他配件也是同理，能分开的尽量分开图层。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;三、PSD 预处理：Photopea 救命稻草&lt;/h2&gt;
+&lt;p&gt;画完之后，别急着往 Live2D 里丢。PSD 文件的格式如果不符合规范，导入 Cubism 时可能会遇到各种诡异问题（比如颜色模式不对、蒙版不支持等等）。&lt;/p&gt;
+&lt;p&gt;这里强烈推荐一个 &lt;strong&gt;在线免费神器：Photopea&lt;/strong&gt;（直接在浏览器搜索即可打开，界面和 PS 几乎一样）。&lt;/p&gt;
+&lt;h3&gt;处理步骤如下：&lt;/h3&gt;
+&lt;ol&gt;
+&lt;li&gt;打开 Photopea，把你的 PSD 文件拖进去。&lt;/li&gt;
+&lt;li&gt;等待加载完成后，先检查图像模式：&lt;/li&gt;
+&lt;/ol&gt;
+&lt;pre&gt;&lt;code&gt;Image → Mode → RGB Color
+Image → Mode → 8 Bits/Channel
+&lt;/code&gt;&lt;/pre&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;strong&gt;清理图层&lt;/strong&gt;：删除所有不需要的隐藏图层、草稿图层、参考线图层，图层越少越干净越好。&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;处理特殊图层&lt;/strong&gt;：如果有文字图层、矢量图层、蒙版、剪贴蒙版，尽量&lt;strong&gt;栅格化为普通图层&lt;/strong&gt;。特别是蒙版，建议在 Photopea 里先跟下面的图层合并掉，否则导入 Live2D 后蒙版效果会丢失或者报错。&lt;/li&gt;
+&lt;li&gt;处理完成后，重新导出：&lt;/li&gt;
+&lt;/ol&gt;
+&lt;pre&gt;&lt;code&gt;File → Save as PSD
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;然后把这个&quot;净化过&quot;的 PSD 再导入 Live2D Cubism，能避开 80% 的导入报错。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;四、导入 Cubism：终于开始动起来了&lt;/h2&gt;
+&lt;p&gt;打开 &lt;strong&gt;Live2D Cubism Editor&lt;/strong&gt;，把处理好的 PSD 直接拖进去（或者通过菜单 File → Import → PSB/PSD 导入）。&lt;/p&gt;
+&lt;p&gt;导入成功后，你会看到所有图层都变成了 Cubism 里的&quot;部件&quot;，接下来就可以开始绑定和制作动态了。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;五、基础动态：头部旋转&lt;/h2&gt;
+&lt;p&gt;Live2D 的核心玩法就是给部件添加&quot;变形&quot;和&quot;参数绑定&quot;。&lt;/p&gt;
+&lt;p&gt;最简单的入门练习是&lt;strong&gt;头部整体的旋转&lt;/strong&gt;：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;在编辑器中，把&lt;strong&gt;头部以及头上所有附属部件&lt;/strong&gt;（头发、耳朵、发饰等）全部选中。&lt;/li&gt;
+&lt;li&gt;给它们添加一个&lt;strong&gt;旋转变形&lt;/strong&gt;（Rotation Deformer）。&lt;/li&gt;
+&lt;li&gt;把这个旋转绑定到参数 &lt;strong&gt;Angle Z&lt;/strong&gt; 上。&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;这样当你拖动 Angle Z 的滑块时，整个头部就会跟着左右旋转了。虽然只是第一步，但看到画出来的角色第一次&quot;动起来&quot;的时候，成就感真的爆棚！&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;六、进阶一点：让头发飘起来&lt;/h2&gt;
+&lt;p&gt;静态的旋转只是开始，Live2D 真正的魅力在于&lt;strong&gt;基于变形器的柔体动态&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;以&quot;前发&quot;为例，制作头发飘动的步骤如下：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;选中&quot;前发&quot;这个部件。&lt;/li&gt;
+&lt;li&gt;右键创建一个 &lt;strong&gt;弯曲变形器&lt;/strong&gt;（Warp Deformer）。&lt;/li&gt;
+&lt;li&gt;给这个变形器绑定一个自定义参数，比如 &lt;code&gt;前发摇摆&lt;/code&gt;。&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/live2d/image-20260506155221138.png&quot; alt=&quot;创建弯曲变形器&quot; /&gt;&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;点击参数面板上的 &amp;lt;img src=&quot;/images/live2d/image-20260506155230185.png&quot; alt=&quot;编辑按钮&quot; style=&quot;width:10%;display:inline;vertical-align:middle&quot;&amp;gt; 编辑按钮，进入关键帧编辑模式。&lt;/li&gt;
+&lt;li&gt;把参数滑块拖到&lt;strong&gt;最左端&lt;/strong&gt;，调整前发的弯曲趋势（比如向左飘）；再把滑块拖到&lt;strong&gt;最右端&lt;/strong&gt;，调整成向右飘的趋势。&lt;/li&gt;
+&lt;li&gt;来回拖动滑块，预览一下运动轨迹是否自然，有没有违和的穿帮或者过度拉伸。&lt;/li&gt;
+&lt;/ol&gt;
+&lt;blockquote&gt;
+&lt;p&gt;💡 &lt;strong&gt;小贴士&lt;/strong&gt;：第一次调整的时候幅度不用太大，先保证&quot;动起来不奇怪&quot;，再慢慢细化。物理引擎和阻尼参数可以后面再加，让飘动更自然。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;h2&gt;七、Day 1 的感悟&lt;/h2&gt;
+&lt;p&gt;第一天的进度大概就到这里：完成了角色设定、绘制、PSD 预处理、导入 Cubism，以及最基础的头部旋转 + 头发变形器练习。&lt;/p&gt;
+&lt;p&gt;Live2D 比我想象的要复杂一些，但逻辑其实非常清晰——&lt;strong&gt;分层 → 绑定参数 → 调整变形&lt;/strong&gt;。只要每一步都耐心做，哪怕是零基础也能慢慢做出能动的模型。&lt;/p&gt;
+&lt;p&gt;接下来的计划是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;把模型从 Cubism 编辑器里导出，部署到桌面环境里跑起来&lt;/li&gt;
+&lt;li&gt;用 Electron 搭建置顶透明窗口，让 inni 「悬浮」在桌面上&lt;/li&gt;
+&lt;li&gt;接入鼠标追踪和自定义动作系统，让模型能看向你、眨眼睛&lt;/li&gt;
+&lt;li&gt;打通 AI 聊天链路，让 inni 不只是会动，还能跟你说话&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;如果你也对 Live2D 感兴趣，欢迎一起交流！配套桌面宠物项目的代码在这里 👉 &lt;strong&gt;&lt;a href=&quot;https://github.com/swrited/inni-pet&quot;&gt;github.com/swrited/inni-pet&lt;/a&gt;&lt;/strong&gt;&lt;/p&gt;
+&lt;hr /&gt;
+&lt;p&gt;&lt;em&gt;本文为 inni Live2D 制作系列的第一篇，后续会陆续更新。如果对你有帮助，可以点个关注不迷路~&lt;/em&gt;&lt;/p&gt;
+</content:encoded><category>绘画</category><category>Live2D</category><category>Cubism</category><category>绘画</category><category>inni-pet</category></item><item><title>我是怎么把 CPA + NewAPI 串起来的</title><link>https://swrited.github.io/posts/cpa-newapi-blog/</link><guid isPermaLink="true">https://swrited.github.io/posts/cpa-newapi-blog/</guid><description>一次把 CLIProxyAPI、NewAPI、Nginx 和真实域名串起来的实践记录，重点聊分层、日志和排障。</description><pubDate>Wed, 29 Apr 2026 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;这几天我把自己的一套模型调用链路重新整理了一遍，核心是把 &lt;strong&gt;CLIProxyAPI（这里简称 CPA）&lt;/strong&gt; 和 &lt;strong&gt;NewAPI&lt;/strong&gt; 串起来，再通过域名暴露出一个更稳定、可控、方便统一接入的入口。&lt;/p&gt;
+&lt;p&gt;这篇文章记录一下这套结构是怎么搭起来的、每一层各自负责什么、踩过哪些坑，以及为什么我最后会保留这样的分层设计。&lt;/p&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/diagrams/cpa-newapi-flow.svg&quot; alt=&quot;CPA + NewAPI 实际调用链路图&quot; /&gt;&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;一、先说结论：我最后采用的是两层结构&lt;/h2&gt;
+&lt;p&gt;整体结构可以概括成这样：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;客户端 / Hermes / 其他工具
+        ↓
+   NewAPI（3000）
+        ↓
+ CPA / CLIProxyAPI（8317）
+        ↓
+   上游模型供应商
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;再加上对外访问层，就是：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;https://newapi.innilove.xyz
+        ↓
+     Nginx 反向代理
+        ↓
+  本机 NewAPI :3000
+        ↓
+   Channel #1 → 127.0.0.1:8317
+        ↓
+ CPA / CLIProxyAPI
+        ↓
+     各模型上游
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这套方案里：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;CPA / CLIProxyAPI&lt;/strong&gt; 更像底层能力层，负责真正和上游模型打交道&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;NewAPI&lt;/strong&gt; 是外层统一入口，负责渠道、模型映射、统一鉴权和对外接口组织&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Nginx + 域名&lt;/strong&gt; 负责把本地服务变成一个可直接接入的公网入口&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h2&gt;二、为什么要分成两层，而不是直接一个服务顶到底&lt;/h2&gt;
+&lt;p&gt;一开始很多人都会想：既然最终都是转发给模型，为什么不直接让客户端打底层？&lt;/p&gt;
+&lt;p&gt;我最后还是保留两层，主要是因为下面几个原因。&lt;/p&gt;
+&lt;h3&gt;1. 对外入口和底层代理的职责不一样&lt;/h3&gt;
+&lt;p&gt;底层的 CPA 更像是“真正出请求的人”，而 NewAPI 更像是“统一门面”。&lt;/p&gt;
+&lt;p&gt;这样拆开之后：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;外层可以统一接 OpenAI 兼容调用&lt;/li&gt;
+&lt;li&gt;内层可以按自己的方式维护上游渠道&lt;/li&gt;
+&lt;li&gt;某一层需要替换时，不至于把整条链路一起拆掉&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;2. 更适合做模型映射和渠道管理&lt;/h3&gt;
+&lt;p&gt;我这里实际会出现这种情况：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;对外暴露的是一个统一模型名&lt;/li&gt;
+&lt;li&gt;内部真正走的是某个 channel&lt;/li&gt;
+&lt;li&gt;channel 再转发给底层 CPA&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;比如我的实际配置里就有一条关键链路：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;NewAPI 运行在 3000 端口&lt;/strong&gt;&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Channel #1（CodeX）转发到 &lt;code&gt;http://127.0.0.1:8317&lt;/code&gt;&lt;/strong&gt;&lt;/li&gt;
+&lt;li&gt;底层 &lt;code&gt;8317&lt;/code&gt; 就是 CPA / CLIProxyAPI&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这个设计的好处是，外部接入方不需要知道底层到底是哪一个代理进程、跑在什么容器里，也不需要直接接触上游供应商细节。&lt;/p&gt;
+&lt;h3&gt;3. 更容易做日志排查&lt;/h3&gt;
+&lt;p&gt;分层之后，日志能清楚分成两类：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;NewAPI 日志&lt;/strong&gt;：看外层请求有没有进来、路由到了哪里&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;CPA 日志&lt;/strong&gt;：看底层真正打上游时发生了什么&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这对排查特别重要。很多时候问题不是“服务没起来”，而是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;外层路由到了错误渠道&lt;/li&gt;
+&lt;li&gt;底层某个上游没有可用 auth&lt;/li&gt;
+&lt;li&gt;或者流式请求中途断开&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;如果所有逻辑都揉在一个服务里，排错会非常痛苦。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;三、我这套环境的实际落地结构&lt;/h2&gt;
+&lt;h3&gt;1. NewAPI：外层统一入口&lt;/h3&gt;
+&lt;p&gt;我的 NewAPI 本地运行在：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;127.0.0.1:3000&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;它是通过 &lt;strong&gt;systemd --user&lt;/strong&gt; 方式启动的，启动参数里显式指定了日志目录。&lt;/p&gt;
+&lt;p&gt;实际启动命令是：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/home/agentuser/new-api --port 3000 --log-dir /home/agentuser/newapi-logs
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;所以它的关键位置是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;服务文件：&lt;code&gt;/home/agentuser/.config/systemd/user/newapi.service&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;日志目录：&lt;code&gt;/home/agentuser/newapi-logs&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这意味着 NewAPI 本身不是一个“跑一下就算了”的临时进程，而是一个比较正式的本地常驻服务。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h3&gt;2. 对外域名：newapi.innilove.xyz&lt;/h3&gt;
+&lt;p&gt;本地 3000 端口并没有直接裸露到外网，而是通过 &lt;strong&gt;Nginx 反向代理&lt;/strong&gt; 对外暴露。&lt;/p&gt;
+&lt;p&gt;主入口域名是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;http://newapi.innilove.xyz&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;后来也补上了 HTTPS，证书是 Let’s Encrypt，443 已经配置完成。&lt;/p&gt;
+&lt;p&gt;这一层的意义很直接：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;对客户端来说，不需要关心本地端口&lt;/li&gt;
+&lt;li&gt;可以统一走域名&lt;/li&gt;
+&lt;li&gt;后续换端口、换服务实现、换内部结构，外部接入方都不用跟着改&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h3&gt;3. CPA / CLIProxyAPI：底层真实代理&lt;/h3&gt;
+&lt;p&gt;底层我实际使用的是 &lt;strong&gt;CLIProxyAPI&lt;/strong&gt;，它跑在：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;8317&lt;/code&gt; 端口&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;并且是 &lt;strong&gt;Docker 部署&lt;/strong&gt; 的。&lt;/p&gt;
+&lt;p&gt;也就是说：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;3000&lt;/code&gt; 是外层 NewAPI&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;8317&lt;/code&gt; 是底层 CPA&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这一点非常关键。因为我一开始排查时也踩过一个很典型的误区：&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;当某个模型调用失败时，不能简单地认为是 3000 端口挂了。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;很多时候真实情况是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;NewAPI 本身还活着&lt;/li&gt;
+&lt;li&gt;3000 也在监听&lt;/li&gt;
+&lt;li&gt;只是它转发到的上游请求失败了&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;比如我在排查 &lt;code&gt;gpt-5.4&lt;/code&gt; 时，见过这些典型日志：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;503 auth_unavailable / no auth available&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;408 stream disconnected before response.completed&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这说明问题可能出在：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;底层上游授权不可用&lt;/li&gt;
+&lt;li&gt;某次流式请求中途断掉&lt;/li&gt;
+&lt;li&gt;某个 channel 当前不可用&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;而不是 NewAPI 进程本身已经挂掉。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;四、日志路径要分清，不然排错会很绕&lt;/h2&gt;
+&lt;p&gt;这套分层里，最重要的经验之一就是：&lt;/p&gt;
+&lt;p&gt;&lt;strong&gt;先分清你要看的是哪一层的日志。&lt;/strong&gt;&lt;/p&gt;
+&lt;h3&gt;1. NewAPI 日志&lt;/h3&gt;
+&lt;p&gt;NewAPI 的日志目录：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/home/agentuser/newapi-logs
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这个目录适合用来查：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;服务有没有正常启动&lt;/li&gt;
+&lt;li&gt;请求有没有打到外层&lt;/li&gt;
+&lt;li&gt;外层有没有报路由错误&lt;/li&gt;
+&lt;li&gt;基础接口是否正常&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h3&gt;2. CPA / CLIProxyAPI 日志&lt;/h3&gt;
+&lt;p&gt;CLIProxyAPI 是 Docker 部署，但日志不是只能进容器里看。&lt;/p&gt;
+&lt;p&gt;我这里它的日志已经挂载到了宿主机：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;宿主机路径：&lt;code&gt;/home/agentuser/CLIProxyAPI/logs&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;容器内路径：&lt;code&gt;/CLIProxyAPI/logs&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;也就是说，不一定非得 &lt;code&gt;docker exec&lt;/code&gt; 进去，直接在宿主机上看就行。&lt;/p&gt;
+&lt;p&gt;这个目录更适合查：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;上游实际报错&lt;/li&gt;
+&lt;li&gt;某个模型请求失败细节&lt;/li&gt;
+&lt;li&gt;某次 chat/completions 错误原因&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;如果看到类似下面这种文件名，基本就是底层真实报错：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;error-v1-chat-completions-xxxx.log
+&lt;/code&gt;&lt;/pre&gt;
+&lt;hr /&gt;
+&lt;h2&gt;五、为什么我后来强调“验证时优先看真实域名，而不是只看 localhost”&lt;/h2&gt;
+&lt;p&gt;这是这次实践里一个非常实际的教训。&lt;/p&gt;
+&lt;p&gt;理论上，服务本地通了，很多人会觉得“那就没问题了”。但实际上不是。&lt;/p&gt;
+&lt;p&gt;因为在真实链路里，还多了一层：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;Nginx&lt;/li&gt;
+&lt;li&gt;域名&lt;/li&gt;
+&lt;li&gt;HTTPS&lt;/li&gt;
+&lt;li&gt;反向代理头&lt;/li&gt;
+&lt;li&gt;外网访问路径&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;所以如果只验证：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;curl http://127.0.0.1:3000
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;那你只能证明：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;NewAPI 本机端口可能活着&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;但你&lt;strong&gt;不能证明&lt;/strong&gt;：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;域名一定通&lt;/li&gt;
+&lt;li&gt;反向代理没配错&lt;/li&gt;
+&lt;li&gt;外部客户端也能正常访问&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;所以后面我的验证习惯就变成了：&lt;/p&gt;
+&lt;h3&gt;第一优先级&lt;/h3&gt;
+&lt;p&gt;直接验证真实外部入口：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;http://newapi.innilove.xyz
+&lt;/code&gt;&lt;/pre&gt;
+&lt;h3&gt;第二优先级&lt;/h3&gt;
+&lt;p&gt;再看本地服务端口：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;http://127.0.0.1:3000
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这个顺序更接近真实用户视角，也更容易提前发现反向代理层的问题。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;六、这套结构带来的几个实际好处&lt;/h2&gt;
+&lt;h3&gt;1. 调用入口统一&lt;/h3&gt;
+&lt;p&gt;对外只需要记住一个域名入口，不用关心底层到底连了几个模型、几个渠道、几个代理。&lt;/p&gt;
+&lt;h3&gt;2. 可替换性更高&lt;/h3&gt;
+&lt;p&gt;未来如果我要：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;替换底层代理实现&lt;/li&gt;
+&lt;li&gt;新增别的 provider&lt;/li&gt;
+&lt;li&gt;对某个模型单独调路由&lt;/li&gt;
+&lt;li&gt;做灰度切换&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;都可以优先在内层做，而不影响外部调用方式。&lt;/p&gt;
+&lt;h3&gt;3. 更适合做个人化中间层&lt;/h3&gt;
+&lt;p&gt;像我这种场景，不只是“把请求转发出去”，而是还希望有：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;自定义模型名&lt;/li&gt;
+&lt;li&gt;渠道映射&lt;/li&gt;
+&lt;li&gt;统一接口风格&lt;/li&gt;
+&lt;li&gt;统一日志入口&lt;/li&gt;
+&lt;li&gt;更顺手的域名访问&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;那 NewAPI 作为外层就非常合适。&lt;/p&gt;
+&lt;h3&gt;4. 出问题时更容易定位&lt;/h3&gt;
+&lt;p&gt;可以快速判断问题在哪一层：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;域名不通 → 先看 Nginx / 443 / 反代&lt;/li&gt;
+&lt;li&gt;3000 正常、请求失败 → 看 NewAPI 路由&lt;/li&gt;
+&lt;li&gt;NewAPI 正常、上游报错 → 看 CPA / CLIProxyAPI&lt;/li&gt;
+&lt;li&gt;底层日志显示 auth unavailable → 看上游认证池&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这种分层定位，比单体结构的“全堆在一起”清晰太多了。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;七、这次实践里踩到的坑&lt;/h2&gt;
+&lt;h3&gt;坑 1：把“端口活着”和“整条链路正常”混为一谈&lt;/h3&gt;
+&lt;p&gt;3000 端口活着，不代表：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;上游一定可用&lt;/li&gt;
+&lt;li&gt;某个模型一定可用&lt;/li&gt;
+&lt;li&gt;流式输出一定稳定&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;服务“活着”和“能正确完成某类请求”，是两回事。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h3&gt;坑 2：看到失败就以为外层挂了&lt;/h3&gt;
+&lt;p&gt;尤其是遇到：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;503 no auth available&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;408 stream disconnected&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这种报错时，很容易本能觉得是外层服务炸了。&lt;/p&gt;
+&lt;p&gt;但实际上，很多时候只是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;外层还在&lt;/li&gt;
+&lt;li&gt;路由还在&lt;/li&gt;
+&lt;li&gt;底层某个上游请求失败了&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这个判断如果错了，会把排障方向带偏。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h3&gt;坑 3：日志不分层&lt;/h3&gt;
+&lt;p&gt;一旦把 NewAPI 日志和 CPA 日志混在一起看，信息会非常乱。&lt;/p&gt;
+&lt;p&gt;正确做法是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;先看外层有没有收到请求&lt;/li&gt;
+&lt;li&gt;再看外层转发到了哪里&lt;/li&gt;
+&lt;li&gt;最后看底层上游为什么失败&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这样会省很多时间。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;八、如果你也想复刻这套结构，可以怎么搭&lt;/h2&gt;
+&lt;p&gt;一个最简思路如下：&lt;/p&gt;
+&lt;h3&gt;第一步：先把底层代理单独跑起来&lt;/h3&gt;
+&lt;p&gt;先让 CPA / CLIProxyAPI 在本机某个端口稳定运行，比如：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;127.0.0.1:8317
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;确保它本身可以完成最基础的模型请求。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h3&gt;第二步：再让 NewAPI 接到它前面&lt;/h3&gt;
+&lt;p&gt;在 NewAPI 里配置一个 channel，把模型请求转发给：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;http://127.0.0.1:8317
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;先只做一条最小可用链路，不要一开始就堆太多模型和太多路由规则。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h3&gt;第三步：把 NewAPI 作为本地常驻服务托管&lt;/h3&gt;
+&lt;p&gt;用 systemd、supervisor 或容器都行，但核心是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;服务要能稳定常驻&lt;/li&gt;
+&lt;li&gt;重启后能自动恢复&lt;/li&gt;
+&lt;li&gt;日志目录要单独留出来&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h3&gt;第四步：最后再上域名和 HTTPS&lt;/h3&gt;
+&lt;p&gt;先保证本机链路通，再上反向代理。&lt;/p&gt;
+&lt;p&gt;推荐顺序：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;本地 &lt;code&gt;3000 -&amp;gt; 8317&lt;/code&gt; 通&lt;/li&gt;
+&lt;li&gt;Nginx 反代通&lt;/li&gt;
+&lt;li&gt;域名通&lt;/li&gt;
+&lt;li&gt;HTTPS 通&lt;/li&gt;
+&lt;li&gt;再做真实客户端接入验证&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;不要一上来就一边调反代一边调底层模型，那样会把变量搅在一起。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;九、我现在怎么看这套架构&lt;/h2&gt;
+&lt;p&gt;如果只是“能用就行”，它看起来有点绕。&lt;/p&gt;
+&lt;p&gt;但如果你已经有下面这些需求：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;多个模型来源&lt;/li&gt;
+&lt;li&gt;多渠道转发&lt;/li&gt;
+&lt;li&gt;统一接口风格&lt;/li&gt;
+&lt;li&gt;域名入口&lt;/li&gt;
+&lt;li&gt;后续可能扩展更多 provider&lt;/li&gt;
+&lt;li&gt;希望出问题时能快速分层排查&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;那 &lt;strong&gt;CPA + NewAPI&lt;/strong&gt; 这种两层结构其实很顺手。&lt;/p&gt;
+&lt;p&gt;它不是最短路径，但对“长期维护”和“自己掌控整条链路”来说，体验会好很多。&lt;/p&gt;
+&lt;p&gt;我自己这次折腾下来最大的感受就是：&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;真正重要的，不只是把服务跑起来，而是把“入口、转发、日志、排障”这四件事都理顺。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;只有这样，这套东西后面才不会越用越乱。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十、最后做个简短总结&lt;/h2&gt;
+&lt;p&gt;我的这套链路核心就是：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;strong&gt;NewAPI 在外层&lt;/strong&gt;：负责统一入口、渠道映射、对外接口&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;CPA / CLIProxyAPI 在内层&lt;/strong&gt;：负责真实打上游模型&lt;/li&gt;
+&lt;li&gt;&lt;strong&gt;Nginx + 域名在最外面&lt;/strong&gt;：负责公网访问和 HTTPS&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;已知关键点：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;NewAPI：&lt;code&gt;3000&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;CPA / CLIProxyAPI：&lt;code&gt;8317&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;NewAPI 对外域名：&lt;code&gt;newapi.innilove.xyz&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;NewAPI 日志：&lt;code&gt;/home/agentuser/newapi-logs&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;CPA 日志：&lt;code&gt;/home/agentuser/CLIProxyAPI/logs&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;如果后面我再继续完善这套链路，我大概率会继续补这几块：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;更稳定的超时与重试策略&lt;/li&gt;
+&lt;li&gt;更细的模型/渠道健康检查&lt;/li&gt;
+&lt;li&gt;更清晰的错误分层提示&lt;/li&gt;
+&lt;li&gt;更方便复用的部署文档&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;如果你也在折腾自己的模型网关，希望这篇记录能帮你少踩几个坑。&lt;/p&gt;
+</content:encoded><category>Deployment</category><category>AI Infra</category><category>NewAPI</category><category>CPA</category><category>Deployment</category></item><item><title>我的服务器昨晚被打了：一次 SSH 弱口令爆破入侵复盘</title><link>https://swrited.github.io/posts/ssh-bruteforce-intrusion-analysis/</link><guid isPermaLink="true">https://swrited.github.io/posts/ssh-bruteforce-intrusion-analysis/</guid><description>一次典型的 SSH 弱密码爆破导致的服务器入侵事件复盘，记录了攻击者如何在 13 秒内完成后门投放、多层持久化和远控连接建立。</description><pubDate>Wed, 29 Apr 2026 00:00:00 GMT</pubDate><content:encoded>&lt;p&gt;昨晚我本来只是准备收个尾，结果打开服务器一看，发现机器不太对劲。
+这次攻击没有什么花哨的 0day，也不是复杂的供应链攻击，&lt;strong&gt;攻击入口非常朴素：SSH 密码爆破&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;但真正让我警惕的，不是“它怎么进来的”，而是——&lt;strong&gt;攻击者在成功登录后的十几秒内，就完成了后门投放、持久化、痕迹清除和远控连接建立。&lt;/strong&gt;&lt;/p&gt;
+&lt;p&gt;这篇文章把整个过程整理出来，既是一次复盘，也希望给还在开放 SSH 密码登录的人提个醒。&lt;/p&gt;
+&lt;p&gt;&lt;img src=&quot;https://swrited.github.io/images/diagrams/ssh-incident-timeline.svg&quot; alt=&quot;SSH 弱口令入侵时间线图&quot; /&gt;&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;一、事件概述&lt;/h2&gt;
+&lt;p&gt;先说结论：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;攻击者通过 &lt;strong&gt;SSH 弱密码爆破&lt;/strong&gt; 成功登录了服务器上的 &lt;code&gt;ubuntu&lt;/code&gt; 账号&lt;/li&gt;
+&lt;li&gt;成功登录后，&lt;strong&gt;约 13 秒内&lt;/strong&gt; 完成了恶意程序投放与启动&lt;/li&gt;
+&lt;li&gt;后门具备以下能力：
+&lt;ul&gt;
+&lt;li&gt;DDoS 攻击&lt;/li&gt;
+&lt;li&gt;远程 Shell 控制&lt;/li&gt;
+&lt;li&gt;SOCKS5 代理&lt;/li&gt;
+&lt;li&gt;C2 心跳通信&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;攻击者还额外做了多层持久化：
+&lt;ul&gt;
+&lt;li&gt;Cron 定时拉起&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/profile.d/&lt;/code&gt; 登录触发&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;init.d&lt;/code&gt; 开机自启&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;authorized_keys&lt;/code&gt; 植入 SSH 公钥后门&lt;/li&gt;
+&lt;/ul&gt;
+&lt;/li&gt;
+&lt;li&gt;当时后门仍与 C2 服务器保持活跃连接&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;一句话总结就是：&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;&lt;strong&gt;这不是“被扫到一下”那么简单，而是服务器已经被完整接管，并被改造成一台可远程操控的肉鸡。&lt;/strong&gt;&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;hr /&gt;
+&lt;h2&gt;二、服务器背景&lt;/h2&gt;
+&lt;p&gt;本次出事的环境：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;系统：Ubuntu（腾讯云云服务器）&lt;/li&gt;
+&lt;li&gt;公网 IP：&lt;code&gt;175.24.197.166&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;内网 IP：&lt;code&gt;10.0.0.11&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;调查过程中主要依赖了这些工具：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;ss&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;ps&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;lsof&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;journalctl&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;grep&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;find&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;strings&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;tcpdump&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;openssl&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;curl&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h2&gt;三、攻击是怎么开始的&lt;/h2&gt;
+&lt;p&gt;从日志来看，攻击并不是瞬间发生的，而是经历了一个明显的爆破过程。&lt;/p&gt;
+&lt;h3&gt;1. 主攻击源&lt;/h3&gt;
+&lt;p&gt;主攻击 IP：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;124.222.123.53&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;归属：腾讯云上海节点&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这个 IP 对 &lt;code&gt;ubuntu&lt;/code&gt; 用户进行了长时间的密码尝试。
+尤其在 &lt;strong&gt;4 月 28 日 23:30 到 23:34&lt;/strong&gt; 之间，爆破节奏变得非常密集。&lt;/p&gt;
+&lt;p&gt;例如日志片段里能看到：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Apr 28 23:30:01 Failed password for ubuntu from 124.222.123.53
+Apr 28 23:30:03 Failed password for ubuntu from 124.222.123.53
+Apr 28 23:30:06 Failed password for ubuntu from 124.222.123.53
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;根据报告估算：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;爆破频率约为 &lt;strong&gt;每 2 秒 1~2 次&lt;/strong&gt;&lt;/li&gt;
+&lt;li&gt;持续约 &lt;strong&gt;4 分钟&lt;/strong&gt;&lt;/li&gt;
+&lt;li&gt;累计尝试大约 &lt;strong&gt;80~100 次&lt;/strong&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;然后，在 &lt;strong&gt;23:34:02&lt;/strong&gt;，它成功了。&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;Accepted password for ubuntu from 124.222.123.53 port 39504 ssh2
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这行日志出现的时候，事情的性质就已经变了：
+从“有人在撞门”，变成了“人已经进屋了”。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;四、真正可怕的部分：13 秒完成投毒&lt;/h2&gt;
+&lt;p&gt;攻击者成功登录后的动作非常快，几乎可以确定是&lt;strong&gt;自动化脚本&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;根据 &lt;code&gt;auth.log&lt;/code&gt; 中记录的 sudo 命令，整个过程大致是这样的：&lt;/p&gt;
+&lt;h3&gt;23:34:05：测试提权能力&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;sudo whoami
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;确认当前 &lt;code&gt;ubuntu&lt;/code&gt; 拥有 sudo 权限。&lt;/p&gt;
+&lt;h3&gt;23:34:05：创建傀儡账号&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;useradd -m -s /bin/bash -N admin
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这一步通常是为了留一个备用入口，不过后续报告显示这个账号已经被删除。&lt;/p&gt;
+&lt;h3&gt;23:34:08：清痕迹 + 写后门&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;mkdir -p /root/.ssh
+rm -rf /root/.bash_history
+tee /usr/bin/adb0
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这里非常关键：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;rm -rf /root/.bash_history&lt;/code&gt;：第一时间擦 root 历史记录&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;tee /usr/bin/adb0&lt;/code&gt;：直接通过标准输入把一个 &lt;strong&gt;5MB 的 ELF 可执行文件&lt;/strong&gt; 写进系统里&lt;/li&gt;
+&lt;/ul&gt;
+&lt;h3&gt;23:34:15：赋权并启动&lt;/h3&gt;
+&lt;pre&gt;&lt;code&gt;chmod 777 /usr/bin/adb0
+nohup /usr/bin/adb0 &amp;amp;
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;到这里，恶意程序已经开始后台运行。&lt;/p&gt;
+&lt;p&gt;也就是说：&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;从成功登录到后门启动，&lt;strong&gt;总共只用了 13 秒&lt;/strong&gt;。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;这说明三件事：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;这不是手工操作，而是成熟脚本化攻击&lt;/li&gt;
+&lt;li&gt;恶意载荷早已准备好&lt;/li&gt;
+&lt;li&gt;攻击者对这种云主机环境非常熟悉&lt;/li&gt;
+&lt;/ol&gt;
+&lt;hr /&gt;
+&lt;h2&gt;五、这不是一个普通木马，而是一套完整的后门体系&lt;/h2&gt;
+&lt;p&gt;主恶意文件是：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/usr/bin/adb0
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;文件特征：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;5MB&lt;/li&gt;
+&lt;li&gt;ELF 64-bit&lt;/li&gt;
+&lt;li&gt;x86-64&lt;/li&gt;
+&lt;li&gt;Go 编写&lt;/li&gt;
+&lt;li&gt;静态链接&lt;/li&gt;
+&lt;li&gt;stripped 处理过&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;报告里通过字符串分析，提取到了几个核心模块名：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;Attack_Run&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;Shell_Run&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;Proxy_Run&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;Onlineinfo_Run&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;这几个名字已经把能力暴露得很直白了：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;Attack_Run&lt;/code&gt;：执行 DDoS 攻击&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;Shell_Run&lt;/code&gt;：远程命令执行 / Shell 控制&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;Proxy_Run&lt;/code&gt;：代理转发&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;Onlineinfo_Run&lt;/code&gt;：上线/心跳汇报&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;也就是说，它不是单纯“上线报到”的小木马，而是一个&lt;strong&gt;可被远程操纵的多功能后门&lt;/strong&gt;。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;六、攻击者不只放了一个文件，而是放了四个副本&lt;/h2&gt;
+&lt;p&gt;更麻烦的是，恶意程序并不只存在于一个位置。&lt;/p&gt;
+&lt;p&gt;MD5 相同的副本一共有四份：&lt;/p&gt;
+&lt;ol&gt;
+&lt;li&gt;&lt;code&gt;/usr/bin/adb0&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/usr/lib/libgdi.so.0.8.2&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/profile.d/bash.cfg&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/boot/system.pub&lt;/code&gt;&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;这意味着即使你删掉其中一个，其他副本也可能重新把它拉起来。&lt;/p&gt;
+&lt;p&gt;这个攻击样本的思路不是“单点存活”，而是&lt;strong&gt;多点冗余、交叉自恢复&lt;/strong&gt;。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;七、它还做了四层持久化&lt;/h2&gt;
+&lt;p&gt;如果只写个后门进程，那还算初级。
+真正棘手的是，这次攻击做了&lt;strong&gt;四层持久化&lt;/strong&gt;。&lt;/p&gt;
+&lt;h3&gt;1. Cron 定时任务&lt;/h3&gt;
+&lt;p&gt;在 &lt;code&gt;/etc/crontab&lt;/code&gt; 中被插入了：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;*/1 * * * * root /.mod
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;而 &lt;code&gt;/.mod&lt;/code&gt; 的内容是：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;#!/bin/bash
+/usr/lib/libgdi.so.0.8.2
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;也就是说，每分钟都会尝试重新启动恶意副本。&lt;/p&gt;
+&lt;h3&gt;2. 登录触发执行&lt;/h3&gt;
+&lt;p&gt;在 &lt;code&gt;/etc/profile.d/&lt;/code&gt; 下放了两个文件：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;/etc/profile.d/bash.cfg.sh&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/profile.d/bash.cfg&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;其中：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;source /etc/profile.d/bash.cfg
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;表面上像是一个 shell 配置片段，实际上 &lt;code&gt;bash.cfg&lt;/code&gt; 本体是一个 &lt;strong&gt;5MB 的 ELF 木马文件&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;也就是说，只要用户登录 shell，这个恶意程序就会被顺手带起来。&lt;/p&gt;
+&lt;h3&gt;3. 开机自启&lt;/h3&gt;
+&lt;p&gt;攻击者伪造了一个看起来很正常的服务名：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;dns-udp4
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;相关脚本位于：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;/etc/init.d/dns-udp4&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/rc.d/dns-udp4&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;真正执行的是：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/boot/system.pub
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;而 &lt;code&gt;system.pub&lt;/code&gt; 其实也是那个恶意程序的副本。&lt;/p&gt;
+&lt;p&gt;这一步保证了：&lt;strong&gt;哪怕服务器重启，后门依旧能回来。&lt;/strong&gt;&lt;/p&gt;
+&lt;h3&gt;4. SSH 公钥后门&lt;/h3&gt;
+&lt;p&gt;这是我觉得最危险的一层。&lt;/p&gt;
+&lt;p&gt;攻击者把自己的公钥植入到了：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/home/ubuntu/.ssh/authorized_keys
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这意味着什么？&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;即使你把 &lt;code&gt;ubuntu&lt;/code&gt; 的密码改了，只要这个公钥还在，对方依然能直接 SSH 登录。&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;很多人处理入侵时只改密码，但&lt;strong&gt;不清理 authorized_keys&lt;/strong&gt;，等于门锁换了，备用钥匙还在贼手里。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;八、它甚至还带了“简易 Rootkit”能力&lt;/h2&gt;
+&lt;p&gt;更阴的是，攻击者还放了一个脚本：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;/etc/profile.d/gateway.sh
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这个脚本做的事情不是继续投毒，而是&lt;strong&gt;劫持常见系统命令&lt;/strong&gt;，把恶意进程和连接“隐藏起来”。&lt;/p&gt;
+&lt;p&gt;被劫持的命令包括：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;ps&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;ss&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;ls&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;find&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;netstat&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;lsof&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;核心思路就是：
+你一查进程、查网络、查文件，它先帮你把关键字过滤掉。&lt;/p&gt;
+&lt;p&gt;比如这些关键词会被隐藏：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;bash.cfg&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;.mod&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;libgdi.so.0.8.2&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;gateway.sh&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;adm0&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;stargate&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;所以如果你只是习惯性跑一句：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;ss -tp | grep 45.150.226.78
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;可能什么都看不到。&lt;/p&gt;
+&lt;p&gt;但换一种绕过方式，就能看到真实连接：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;netstat -antp | grep 45.150.226.78
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这时候才会暴露出：&lt;/p&gt;
+&lt;pre&gt;&lt;code&gt;10.0.0.11:45502 -&amp;gt; 45.150.226.78:65111 ESTABLISHED
+&lt;/code&gt;&lt;/pre&gt;
+&lt;p&gt;这类做法虽然称不上内核级 rootkit，但已经足够骗过很多日常排查。&lt;/p&gt;
+&lt;hr /&gt;
+&lt;h2&gt;九、C2 服务器是谁&lt;/h2&gt;
+&lt;p&gt;报告里提取到的 C2 信息如下：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;IP：&lt;code&gt;45.150.226.78&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;端口：&lt;code&gt;65111&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;归属：美国西雅图，Spartan Host&lt;/li&gt;
+&lt;li&gt;协议：&lt;strong&gt;WebSocket + TLS&lt;/strong&gt;&lt;/li&gt;
+&lt;li&gt;TLS 证书 CN：&lt;code&gt;127.0.0.1&lt;/code&gt;（伪装成本地开发环境）&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;抓包显示它当时仍在持续心跳，说明后门没有“打完就走”，而是&lt;strong&gt;一直在线等指令&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;这也意味着：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;服务器随时可能被拉去参与 DDoS&lt;/li&gt;
+&lt;li&gt;也可能被当作代理中转&lt;/li&gt;
+&lt;li&gt;还可能继续下发 shell 指令做横向操作&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十、这次事件里最值得警惕的地方&lt;/h2&gt;
+&lt;p&gt;这次入侵让我最有感触的，不是样本多高级，而是它体现出一种非常成熟的“工业化攻击流程”：&lt;/p&gt;
+&lt;h3&gt;1. 入口简单，但足够有效&lt;/h3&gt;
+&lt;p&gt;只要 SSH 密码登录还开着，而且密码强度不够，爆破永远有人做。&lt;/p&gt;
+&lt;h3&gt;2. 成功后动作极快&lt;/h3&gt;
+&lt;p&gt;13 秒完成投毒，这已经不是“试试看”，而是标准化流水线。&lt;/p&gt;
+&lt;h3&gt;3. 持久化层层叠加&lt;/h3&gt;
+&lt;p&gt;Cron、profile、init、authorized_keys 一起上，防的是“你只清一半”。&lt;/p&gt;
+&lt;h3&gt;4. 会主动隐藏自己&lt;/h3&gt;
+&lt;p&gt;它知道管理员会查 &lt;code&gt;ps&lt;/code&gt;、&lt;code&gt;ss&lt;/code&gt;、&lt;code&gt;lsof&lt;/code&gt;，所以先把这些命令做了过滤。&lt;/p&gt;
+&lt;h3&gt;5. 目标不是单纯驻留，而是拿去利用&lt;/h3&gt;
+&lt;p&gt;从功能模块看，这台机器更像被改造成了一个：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;DDoS 节点&lt;/li&gt;
+&lt;li&gt;代理节点&lt;/li&gt;
+&lt;li&gt;可远程操作的跳板&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十一、如果你也遇到类似情况，优先做什么&lt;/h2&gt;
+&lt;p&gt;报告里给出的处置建议非常实用，我按优先级重新整理一下。&lt;/p&gt;
+&lt;h3&gt;第一优先级：先断攻击者登录能力&lt;/h3&gt;
+&lt;ol&gt;
+&lt;li&gt;删除 &lt;code&gt;authorized_keys&lt;/code&gt; 中的攻击者公钥&lt;/li&gt;
+&lt;li&gt;修改被爆破账号密码&lt;/li&gt;
+&lt;li&gt;如果条件允许，立刻关闭 SSH 密码登录，仅保留密钥认证&lt;/li&gt;
+&lt;/ol&gt;
+&lt;p&gt;如果你只做“改密码”，但不删公钥，那基本等于没处理干净。&lt;/p&gt;
+&lt;h3&gt;第二优先级：杀掉活跃后门&lt;/h3&gt;
+&lt;p&gt;先终止恶意进程，再排查对应的网络连接和父子链路。&lt;/p&gt;
+&lt;p&gt;因为只删文件、不杀进程，恶意进程仍可能继续存活在内存里，甚至重新落盘。&lt;/p&gt;
+&lt;h3&gt;第三优先级：清持久化&lt;/h3&gt;
+&lt;p&gt;要一起清掉：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;&lt;code&gt;/etc/crontab&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/.mod&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/profile.d/bash.cfg&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/profile.d/bash.cfg.sh&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/profile.d/gateway.sh&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/init.d/dns-udp4&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/rc.d/dns-udp4&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/boot/system.pub&lt;/code&gt;&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;/etc/.cfg&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;如果漏掉其中任何一层，都可能在你下一次登录、下一分钟、下一次重启时复活。&lt;/p&gt;
+&lt;h3&gt;第四优先级：把 SSH 安全面重新做一遍&lt;/h3&gt;
+&lt;p&gt;这次事件背后最根本的问题，其实还是 SSH 暴露面太大。&lt;/p&gt;
+&lt;p&gt;建议至少做到：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;禁止密码登录&lt;/li&gt;
+&lt;li&gt;只允许密钥认证&lt;/li&gt;
+&lt;li&gt;使用高强度 Ed25519 密钥&lt;/li&gt;
+&lt;li&gt;限制 SSH 来源 IP&lt;/li&gt;
+&lt;li&gt;配 fail2ban&lt;/li&gt;
+&lt;li&gt;定期审计 &lt;code&gt;authorized_keys&lt;/code&gt;、&lt;code&gt;crontab&lt;/code&gt;、&lt;code&gt;/etc/profile.d/&lt;/code&gt;&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十二、我从这次事件里学到的教训&lt;/h2&gt;
+&lt;p&gt;如果要把这次事情压缩成一句提醒，那就是：&lt;/p&gt;
+&lt;blockquote&gt;
+&lt;p&gt;&lt;strong&gt;不要把“开着 SSH 密码登录”当成一件无所谓的小事。&lt;/strong&gt;&lt;/p&gt;
+&lt;/blockquote&gt;
+&lt;p&gt;很多时候我们觉得：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;“反正只是个小服务器”&lt;/li&gt;
+&lt;li&gt;“密码我自己知道”&lt;/li&gt;
+&lt;li&gt;“应该没人盯上我”&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;但自动化爆破根本不关心你是谁。
+只要口子开着、密码不够强、没有额外防护，你就只是扫描器字典里的下一个目标。&lt;/p&gt;
+&lt;p&gt;更现实一点说：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;攻击者不一定冲着你的业务来&lt;/li&gt;
+&lt;li&gt;他们可能只是需要一批能用的肉鸡&lt;/li&gt;
+&lt;li&gt;你的服务器一旦被拿下，就可能被用去打别人&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;到那时，损失不只是你自己机器上的数据，还可能包括：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;带宽消耗&lt;/li&gt;
+&lt;li&gt;云厂商封禁&lt;/li&gt;
+&lt;li&gt;IP 信誉受损&lt;/li&gt;
+&lt;li&gt;对外攻击带来的责任风险&lt;/li&gt;
+&lt;/ul&gt;
+&lt;hr /&gt;
+&lt;h2&gt;十三、最后&lt;/h2&gt;
+&lt;p&gt;这次复盘对我来说挺有警示意义。
+最开始看只是“SSH 登录异常”，往后挖才发现已经是&lt;strong&gt;完整后门链路 + C2 在线 + 多层持久化 + 命令隐藏&lt;/strong&gt;。&lt;/p&gt;
+&lt;p&gt;攻击手法不算新，但执行效率和自动化程度很高。
+也正因为它“不新”，所以才更危险——因为说明这已经是被大量复用、很成熟的一套东西了。&lt;/p&gt;
+&lt;p&gt;如果你手里还有对公网开放 SSH 的机器，真的建议现在就去检查这几件事：&lt;/p&gt;
+&lt;ul&gt;
+&lt;li&gt;有没有还开着密码登录&lt;/li&gt;
+&lt;li&gt;密码是不是足够强&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;authorized_keys&lt;/code&gt; 里有没有陌生公钥&lt;/li&gt;
+&lt;li&gt;&lt;code&gt;crontab&lt;/code&gt;、&lt;code&gt;/etc/profile.d/&lt;/code&gt;、&lt;code&gt;init.d&lt;/code&gt; 里有没有奇怪文件&lt;/li&gt;
+&lt;li&gt;有没有异常外连&lt;/li&gt;
+&lt;/ul&gt;
+&lt;p&gt;很多安全问题，不是因为攻击者太强，而是因为系统默认地“太好进”。&lt;/p&gt;
+</content:encoded><category>Security</category><category>Security</category><category>SSH</category><category>Incident Response</category><category>Linux</category></item></channel></rss>
